@@ -105,22 +105,29 @@ Agent: SQL tool loop + memory + streaming SSE
 
 `PRAGMA foreign_keys=ON`. WAL mode. 30s busy_timeout.
 
-## Endpoints (40+)
+## Endpoints (50+)
 
 ```
-/api/auth/{login,logout,me}
+/api/auth/{login,logout,me}                                 email + password
 /api/users {GET POST PATCH DELETE}
-/api/upload {POST}
-/api/queue/batches /api/queue/retry/{id} /api/batch/{id} {DELETE}
-/api/chat {POST}      /api/chat/stream {SSE}     /api/chat/sessions
-/api/data /api/products /api/contacts /api/dashboard /api/search /api/search/semantic
+/api/upload {POST}                                          form field: trade_show
+/api/queue {GET}  /api/queue/batches  /api/queue/retry/{id} /api/batch/{id} {DELETE}
+/api/chat {POST}  /api/chat/stream {SSE}  /api/chat/sessions  /api/chat/history/{sid}
+/api/data?trade_show=&country=&has_qr=&has_gps=             quick filters
+/api/products  /api/contacts  /api/dashboard
+/api/search  /api/search/semantic
+/api/contacts/duplicates                                    dedup suggestions
+/api/contacts/merge {POST}                                  keep_uuid + drop_uuid
+/api/contacts/{uuid}/vcard                                  .vcf download
+/api/export/vcards.zip                                      bulk vCards
 /api/aggregations/{locations,countries,timeline,cameras,messengers,
-                   qr-codes,quality,duplicates,sync-sources,pricing,map-points}
+                   qr-codes,quality,duplicates,sync-sources,pricing,
+                   map-points,trade-shows}
 /api/tags /api/notes /api/meetings /api/events {CRUD}
-/api/image/{folder}/{file}   ← realpath-checked, owner-scoped
+/api/image/{folder}/{file}                                  realpath-checked, owner-scoped
 /api/export/{xlsx,csv,json}
-/api/feedback /api/memories
-/health
+/api/feedback /api/memories /api/config (auth)
+/health (public)
 ```
 
 ## Security
@@ -155,18 +162,20 @@ Client-side fallback in `upload/+page.svelte`:
 
 Server merges in priority: EXIF > client EXIF sidecar > browser geo.
 
-## QR support matrix
+## QR + barcode support matrix
 
-| Type | Outcome |
-|------|---------|
-| vCard | full contact extracted (name, org, phone, email) |
-| WhatsApp `wa.me/<E164>` | phone normalized → E.164 |
-| WhatsApp `wa.me/qr/<code>` | invite_code + deeplink (phone NOT in URL — by design) |
-| WeChat URL | `wechat_qr_url` column |
-| Viber/Telegram/Line/Signal | parsed handle/phone |
-| URL | **fetch landing → parse → person/phone/email/company** |
-| Email/Phone/SMS | direct extract |
-| WiFi | SSID + auth captured |
+| Category | Formats |
+|----------|---------|
+| **Contact cards** | vCard 3.0/4.0, MeCard (Japan/KR) |
+| **Messengers** | WhatsApp (`wa.me/<E164>`, `wa.me/qr/<code>`, `wa.me/message/<code>`), WeChat URL, Viber, Telegram, Line, Signal, Kakao (incl `pf.kakao.com`), Zalo, Skype, Messenger, Instagram, Snapchat, Discord, Threads |
+| **Communication** | `tel:`, `mailto:`, MATMSG, `smsto:`, `sms:` |
+| **Connectivity** | WiFi (`WIFI:T:WPA;S:...;P:...;`) |
+| **Location** | GeoURL (`geo:lat,lng?q=...`) — overrides GPS if EXIF missing |
+| **Calendar** | iCalendar VEVENT — auto-creates meeting row |
+| **Payments** | EPC SEPA (EU bank), UPI (India), PIX (Brazil), Bitcoin, Ethereum |
+| **Profile URLs** | any HTTPS URL — fetched, parsed via JSON-LD + OG + microdata |
+| **1D barcodes** | EAN13, EAN8, UPCA, UPCE, CODE128, CODE39, ITF (via pyzbar symbology) |
+| **Plain text** | stored as-is |
 
 ## URL profile resolver
 
@@ -245,6 +254,37 @@ curl -c jar -X POST localhost:8090/api/auth/login -H 'Content-Type: application/
 # Frontend hot reload (proxy /api → :8090)
 cd frontend && npm run dev
 ```
+
+## Workflow features
+
+### Trade-show grouping
+Tag every upload with a show label (e.g. "CES 2026"). Persists in localStorage on upload page. Filter `/data` by `?trade_show=<name>`. Aggregation endpoint `/api/aggregations/trade-shows` returns counts.
+
+### AI auto-tagging
+Each ingested document gets 3-6 heuristic tags applied automatically:
+- Content type: `product`, `contact-card`, `pricing`, `blurry`
+- Industry: `pumps`, `electronics`, `machinery`, `pharma`, `solar`, …
+- Region: `region-asia`, `region-eu`, `region-na` (from geocoded country)
+- Signal flags: `has-qr`, `has-messenger`, `has-phone`, `has-email`, `has-pricing`
+
+### Currency normalization
+Free-form prices (`$4,850 USD`, `€ 1.234,50`, `RMB 12,000`, `₹999/-`) parsed into:
+- `products.currency` — ISO 4217 code (USD, EUR, CNY, INR, …)
+- `products.price_amount` — numeric value
+
+### Contact deduplication + merge
+- `/api/contacts/duplicates` groups by `phone_e164` or `email` match
+- `/api/contacts/merge` moves children (notes, meetings) to the kept row and deletes the drop
+- vCard download per contact: `GET /api/contacts/{uuid}/vcard` → `.vcf` → opens in phone Contacts
+
+### Quick filters
+`/api/data?trade_show=...&country=...&has_qr=1&has_gps=1` — server-side post-filter visible to user.
+
+### Image lightbox
+Click any thumbnail in `/queue` → full-image modal with side panel (filename, type chip, company, trade-show chip, contact, products with prices, GPS, camera, date). Esc/backdrop closes.
+
+### PWA install
+Bottom banner with "Install" button on Chrome/Edge. Stores dismissal in localStorage so it doesn't nag.
 
 ## Storage backend (local or S3)
 

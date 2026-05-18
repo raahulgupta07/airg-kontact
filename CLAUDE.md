@@ -4,7 +4,7 @@
 
 KONTACT is a **multi-tenant catalog vision RAG agent** — snap photos of product catalogs and contact QRs at trade shows, extract structured data with multi-agent AI vision, and chat with an intelligent agent that runs SQL queries, remembers facts, cites sources with images, and knows who you met.
 
-**Hardened, production-shape**: 25 security/bug fixes/features landed (5 CRITICAL, 8 HIGH, 5 MEDIUM, 4 functional bugs, 3 features) — see "Hardening landmarks" below.
+**Hardened, production-shape**: 35 security/bug fixes/features landed (5 CRITICAL, 8 HIGH, 5 MEDIUM, 4 functional bugs, 13 features) — see "Hardening landmarks" below.
 
 **Architecture**:
 ```
@@ -20,8 +20,9 @@ Phone Camera / Files → Upload (guards) → Queue → Loader (EXIF + QR + phash
 
 ```
 City-KONTACT/
-├── main.py                     # FastAPI entry (40+ endpoints, SSE, slowapi, CORS env-driven)
+├── main.py                     # FastAPI entry (50+ endpoints, SSE, slowapi, CORS env-driven)
 ├── auth.py                     # bcrypt + passlib + itsdangerous + phonenumbers
+├── storage.py                  # Pluggable LocalStorage / S3Storage (boto3) backend
 ├── config.py                   # Env-based config
 ├── chat.py                     # Agent: RAG + SQL tool loop + memory + OpenRouter retry
 ├── tools.py                    # SQL tool (UUID-validated TEMP VIEW per user), introspect, summary
@@ -29,12 +30,17 @@ City-KONTACT/
 ├── database.py                 # SQLite WAL + FTS5 + 12 tables + audit + FK enforced
 ├── vectorstore.py              # ChromaDB + prune_orphans + delete_by_folder
 ├── pipeline/
-│   ├── loader.py               # PIL + EXIF + QR + pre-compute blur + phash
+│   ├── loader.py               # PIL + EXIF + 13 QR/barcode parsers + blur + phash
 │   ├── extractor.py            # Async batch (classifier → agent), skip-blurry, merge loader meta
 │   ├── agents.py               # 8 specialized prompts
 │   ├── geocode.py              # Nominatim reverse geocode (cached, rate-limited)
 │   ├── imagequality.py         # phash + Laplacian blur + near-dup
-│   └── url_resolver.py         # NEW: SSRF-safe URL→JSON-LD/OG/regex contact
+│   ├── url_resolver.py         # SSRF-safe URL→JSON-LD/OG/regex contact
+│   ├── tagger.py               # Heuristic auto-tagger (industry/region/signal)
+│   └── pricing.py              # Currency + numeric amount parser
+├── backup.sh                   # Full system snapshot → backups/*.tar.gz
+├── restore.sh                  # Restore on any server
+├── migrate_to_s3.py            # One-shot upload migration to S3
 ├── sync/                       # WeChat folder watcher
 ├── data/
 │   ├── kontact.db              # SQLite (WAL + FTS5 + 12 tables)
@@ -266,29 +272,36 @@ PATCH  /api/users/{uuid}
 DELETE /api/users/{uuid}
 
 # Upload + queue
-POST   /api/upload              -- 30/min, MIME+size+bomb guards, owner_uuid stamped
-GET    /api/queue/batches
+POST   /api/upload              -- 60/min/user, MIME+size+bomb guards, owner_uuid stamped
+                                   accepts form field: trade_show
+GET    /api/queue/batches       -- per-user (admin: all)
 POST   /api/queue/retry/{id}
-DELETE /api/batch/{id}          -- cascades to chroma via delete_by_folder
+DELETE /api/batch/{id}          -- cascades to chroma + S3 prefix via delete_by_folder
 POST   /api/process/background
 
 # Chat agent
-POST   /api/chat                -- 60/min, SQL tool loop
+POST   /api/chat                -- 120/min/user, SQL tool loop
 POST   /api/chat/stream         -- SSE: session, tool_call, tool_result, chunk, done
 GET    /api/chat/sessions       -- per-user
 
-# Data
+# Data + filters
 GET    /api/data                -- documents (owner-scoped)
+                                   query: ?trade_show=&country=&has_qr=&has_gps=
 GET    /api/documents/{id}
-GET    /api/products
+GET    /api/products            -- now includes currency + price_amount cols
 GET    /api/contacts
+GET    /api/contacts/duplicates -- phone_e164/email dedup suggestions
+POST   /api/contacts/merge      -- keep_uuid + drop_uuid; rewires notes/meetings
+GET    /api/contacts/{uuid}/vcard -- RFC 6350 .vcf download
+GET    /api/export/vcards.zip   -- bulk vCards
 GET    /api/dashboard
 GET    /api/search?q=           -- FTS5
 GET    /api/search/semantic?q=  -- ChromaDB
 
-# 11 aggregations
+# 12 aggregations
 GET    /api/aggregations/{locations,countries,timeline,cameras,messengers,
-                          qr-codes,quality,duplicates,sync-sources,pricing,map-points}
+                          qr-codes,quality,duplicates,sync-sources,pricing,
+                          map-points,trade-shows}
 
 # Workspace CRUD
 {GET POST PATCH DELETE} /api/{tags,notes,meetings,events}
@@ -396,10 +409,23 @@ GET    /health                  -- public
 - **Messengers agg empty**: Read flat platform cols (whatsapp/wechat_qr_url/viber/telegram/line_id/signal_phone) in addition to messengers JSON.
 - **WhatsApp invite parser**: `wa.me/qr/CODE` was extracting "qr" as phone. Now detects `/qr/<code>` and `/message/<code>` patterns, stores `invite_code`, leaves phone null.
 
-### ✨ 3 features
+### ✨ 13 features
 - **URL profile resolver**: SSRF-safe HTTP fetch + JSON-LD/OG/microdata/regex extraction. URL-type QRs now enrich contacts (test: GitHub QR → "Linus Torvalds" + "GitHub").
 - **ChromaDB pruner**: Daily orphan vector cleanup + cascade delete.
-- **Email-only login**: simplified auth surface — frontend locked to `type=email`, backend rejects non-email identifiers and ignores PIN. `.env.example` cleaned (no more `SUPER_ADMIN_PHONE`/`SUPER_ADMIN_PIN`).
+- **Email-only login**: simplified auth surface — frontend locked to `type=email`, backend rejects non-email identifiers and ignores PIN.
+- **Auto-submit upload + auto-redirect**: pick file → instantly POST → 900ms confirmation → `/queue`. One-tap on mobile.
+- **Per-user queue privacy**: `/api/queue/batches` filters by `owner_uuid` for non-admin.
+- **Backup + restore scripts** (`backup.sh`, `restore.sh`): single-archive snapshot of DB + Chroma + uploads + `.env`. WAL-checkpointed.
+- **S3 storage backend** (`storage.py`): opt-in via `STORAGE_BACKEND=s3`. AWS / R2 / B2 / MinIO / Wasabi. Migration script `migrate_to_s3.py`.
+- **13 new QR/barcode formats**: MeCard, VEVENT (→ auto-meeting row), GeoURL (→ overrides GPS if EXIF missing), WiFi, tel/mailto/sms, EPC SEPA, UPI, PIX, Bitcoin, Ethereum, Threads, Kakao `pf.kakao.com`, plus 1D barcodes (EAN13/UPCA/CODE128 via pyzbar symbology).
+- **Trade-show grouping**: `documents.trade_show` + `queue.trade_show`, threaded from upload form. `/api/aggregations/trade-shows` returns labels with counts. localStorage persists last value on upload page.
+- **AI auto-tagging** (`pipeline/tagger.py`): heuristic 3-6 tags applied after each insert (industry, region, content type, signal flags). No extra LLM call.
+- **Currency normalization** (`pipeline/pricing.py`): parse free-form prices → `products.currency` (ISO code) + `products.price_amount` (numeric).
+- **Contact merge + dedup**: `/api/contacts/duplicates` groups by phone_e164/email. `/api/contacts/merge` rewires notes/meetings, deletes drop.
+- **vCard export per contact**: `/api/contacts/{uuid}/vcard` returns RFC 6350 `.vcf` (opens directly in iOS/Android Contacts).
+- **Quick filters on /api/data**: `?trade_show=` `?country=` `?has_qr=` `?has_gps=`.
+- **PWA install banner**: `beforeinstallprompt` → dismissible bottom banner with Install button.
+- **Image lightbox in queue**: thumbnail click → full image + metadata panel (filename, type, company, trade-show chip, contact, products + prices, GPS, camera, date). Esc/backdrop closes.
 
 ## Storage backend
 
