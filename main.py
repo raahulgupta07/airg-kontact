@@ -336,15 +336,24 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
         return name[:200] or "upload"
 
     queued = []
+    skipped = []
     for f in files:
         safe_name = _safe_filename(f.filename)
         ext = os.path.splitext(safe_name)[1].lower()
         if ext not in SUPPORTED:
+            print(f"[upload] skip {safe_name!r}: ext {ext!r} not in SUPPORTED")
+            skipped.append({"name": safe_name, "reason": f"unsupported extension {ext}"})
             continue
-        # MIME sniff via Content-Type header (best-effort; PIL/fitz will reject malformed)
+        # MIME sniff via Content-Type header. iOS sometimes sends '' or octet-stream.
         ctype = (f.content_type or "").lower()
         if ctype and ctype not in _ALLOWED_MIMES:
-            continue
+            # Allow if extension is recognized (iOS HEIC sometimes mis-typed)
+            if ext in {".heic", ".heif", ".jpg", ".jpeg", ".png"}:
+                print(f"[upload] accept {safe_name!r} despite ctype={ctype!r}")
+            else:
+                print(f"[upload] skip {safe_name!r}: ctype {ctype!r} not allowed")
+                skipped.append({"name": safe_name, "reason": f"mime not allowed: {ctype}"})
+                continue
         dest = os.path.join(batch_dir, safe_name)
         # Enforced size cap during streaming write
         written = 0
@@ -400,7 +409,13 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
         db.log_event_safe("upload", "document", None, user["uuid"],
                           detail={"batch_id": batch_id, "file": fname})
 
-    return {"batch_id": batch_id, "queued": len(queued), "files": queued, "auto_processing": True}
+    return {
+        "batch_id": batch_id,
+        "queued": len(queued),
+        "files": queued,
+        "skipped": skipped,
+        "auto_processing": True,
+    }
 
 
 @app.post("/api/upload/folder")

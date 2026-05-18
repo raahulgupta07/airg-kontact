@@ -251,6 +251,7 @@
         };
         xhr.onerror = () => reject(new Error('Network error during upload'));
         xhr.open('POST', '/api/upload');
+        xhr.withCredentials = true;
         xhr.send(formData);
       });
       result = res;
@@ -283,7 +284,17 @@
     <div class="success-block card">
       <div class="success-icon">&#10003;</div>
       <p class="success-text">Batch uploaded</p>
-      <p class="file-count">{files.length} image{files.length !== 1 ? 's' : ''} sent for processing</p>
+      <p class="file-count">{result.queued ?? files.length} of {files.length} image{files.length !== 1 ? 's' : ''} sent for processing</p>
+      {#if result.skipped && result.skipped.length}
+        <div class="skipped-block">
+          <p class="skipped-title">Skipped {result.skipped.length}:</p>
+          <ul class="skipped-list">
+            {#each result.skipped as s}
+              <li>{s.name} — {s.reason}</li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
       <div class="success-actions">
         <button class="send-btn" onclick={() => goto('/queue')}>View queue</button>
         <button class="btn-ghost" onclick={() => {
@@ -729,6 +740,26 @@
     font-size: 14px;
     color: var(--text-muted);
     margin: 0;
+  }
+  .skipped-block {
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: rgba(181, 69, 61, 0.06);
+    border: 1px solid var(--danger);
+    border-radius: var(--r-md);
+    text-align: left;
+  }
+  .skipped-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--danger);
+    margin: 0 0 6px;
+  }
+  .skipped-list {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 0;
+    padding-left: 18px;
   }
   .success-actions {
     display: flex; gap: 8px; margin-top: 8px;
