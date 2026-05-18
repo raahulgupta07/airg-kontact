@@ -113,15 +113,16 @@ class ChatRequest(BaseModel):
 @app.post("/api/auth/login")
 @(limiter.limit("10/minute") if limiter else (lambda f: f))
 async def login(payload: dict, request: Request, response: Response):
-    identifier = (payload.get("identifier") or "").strip()
-    secret = payload.get("secret") or ""
+    # Accept identifier or legacy 'email' field. Email + password only.
+    identifier = (payload.get("identifier") or payload.get("email") or "").strip()
+    secret = payload.get("secret") or payload.get("password") or ""
     ip = request.client.host if request.client else ""
     if not identifier or not secret:
-        raise HTTPException(400, "identifier and secret required")
+        raise HTTPException(400, "email and password required")
     if is_locked(identifier):
         raise HTTPException(429, "too many attempts, locked")
     kind, value = normalize_identifier(identifier)
-    if kind == "unknown":
+    if kind != "email":
         record_login_attempt(identifier, ip, 0)
         raise HTTPException(401, "invalid credentials")
     with db.db() as c:
@@ -131,8 +132,6 @@ async def login(payload: dict, request: Request, response: Response):
             raise HTTPException(401, "invalid credentials")
         ok = False
         if user["password_hash"] and verify_secret(secret, user["password_hash"]):
-            ok = True
-        elif user["pin_hash"] and verify_secret(secret, user["pin_hash"]):
             ok = True
         record_login_attempt(identifier, ip, 1 if ok else 0)
         if not ok:

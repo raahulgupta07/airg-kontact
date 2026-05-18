@@ -71,19 +71,19 @@
 
     <form onsubmit={submit} novalidate>
       <label class="field">
-        <span>Email or phone</span>
+        <span>Email</span>
         <input
           class="input"
-          type="text"
+          type="email"
           bind:value={identifier}
-          autocomplete="username"
+          autocomplete="email"
           required
           placeholder="you@example.com"
         />
       </label>
 
       <label class="field">
-        <span>Password or PIN</span>
+        <span>Password</span>
         <div class="input-wrap">
           <input
             class="input pw"
@@ -134,7 +134,6 @@
       </button>
     </form>
 
-    <p class="hint">PIN is 4 digits. Password and PIN both work.</p>
     {#if remember}
       <p class="warn-hint">⚠ Credentials stored locally. Use only on your own device.</p>
     {/if}
