@@ -17,6 +17,7 @@ from pipeline.extractor import extract_batch
 import database as db
 from database import db as db_ctx
 import vectorstore as vs
+from storage import storage, upload_key
 import chat
 import memory
 from auth import (
@@ -394,10 +395,19 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
                 page_dest = os.path.join(batch_dir, page_name)
                 img.save(page_dest, format="JPEG", quality=90)
                 db.queue_add(batch_id, page_name, page_dest, owner_uuid=user["uuid"])
+                # Mirror to remote storage (no-op for local backend)
+                try:
+                    storage.save_file(upload_key(batch_id, page_name), page_dest, "image/jpeg")
+                except Exception as _se:
+                    print(f"[storage] mirror failed for {page_name}: {_se}")
                 queued.append(page_name)
             doc.close()
         else:
             db.queue_add(batch_id, safe_name, dest, owner_uuid=user["uuid"])
+            try:
+                storage.save_file(upload_key(batch_id, safe_name), dest, f.content_type or None)
+            except Exception as _se:
+                print(f"[storage] mirror failed for {safe_name}: {_se}")
             queued.append(safe_name)
 
     # Auto-process in background after upload
@@ -504,6 +514,11 @@ def delete_batch(batch_id: str, user=Depends(current_user)):
         vs.delete_by_folder(batch_id)
     except Exception as e:
         print(f"[vs] delete_by_folder error: {e}")
+    # Cascade to storage (S3 prefix or local dir)
+    try:
+        storage.delete_prefix(batch_id)
+    except Exception as e:
+        print(f"[storage] delete_prefix error: {e}")
     db.log_event_safe("delete", "batch", batch_id, user["uuid"], detail={"count": count})
     return {"deleted": batch_id, "count": count}
 
@@ -992,13 +1007,30 @@ def _safe_under(base_dir: str, candidate: str) -> bool:
 
 @app.get("/api/image/{folder}/{filename:path}")
 async def serve_image(folder: str, filename: str, user=Depends(current_user)):
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, RedirectResponse
     if '..' in folder or '..' in filename or folder.startswith('/') or filename.startswith('/'):
         raise HTTPException(400, "Invalid path")
     if '\x00' in folder or '\x00' in filename:
         raise HTTPException(400, "Invalid path")
 
     is_admin = user.get("role") in ("super_admin", "admin")
+
+    def _serve_from_storage_or_fail() -> "FileResponse | RedirectResponse":
+        """Try remote storage (S3) or local file; never escapes UPLOADS_DIR."""
+        key = upload_key(folder, filename)
+        # S3 backend → redirect to presigned URL (short-lived)
+        if storage.backend_name() == "s3":
+            url = storage.presigned_url(key, expires_seconds=600)
+            if url:
+                return RedirectResponse(url)
+        # Local fallback (also primary path for local backend)
+        candidate = os.path.join(config.UPLOADS_DIR, folder, filename)
+        if not _safe_under(config.UPLOADS_DIR, candidate):
+            raise HTTPException(403, "outside uploads dir")
+        if os.path.isfile(candidate):
+            return FileResponse(candidate)
+        raise HTTPException(404, "not found")
+
     try:
         c = db._conn()
         try:
@@ -1026,19 +1058,12 @@ async def serve_image(folder: str, filename: str, user=Depends(current_user)):
                         "SELECT file_path, owner_uuid FROM queue WHERE batch_id = ? AND file_name = ? AND owner_uuid = ?",
                         (folder, filename, user["uuid"]),
                     ).fetchone()
-                if q_row and q_row["file_path"] and os.path.isfile(q_row["file_path"]):
-                    fp = q_row["file_path"]
-                    if not _safe_under(config.UPLOADS_DIR, fp):
-                        raise HTTPException(403, "outside uploads dir")
-                    return FileResponse(fp)
+                if q_row:
+                    return _serve_from_storage_or_fail()
                 raise HTTPException(404, "not found")
 
-            # Use authoritative source_path from document, fall back to constructed path
-            fp = doc_row["source_path"] or os.path.join(config.UPLOADS_DIR, folder, filename)
-            if not _safe_under(config.UPLOADS_DIR, fp):
-                raise HTTPException(403, "outside uploads dir")
-            if os.path.isfile(fp):
-                return FileResponse(fp)
+            # Document row exists -> serve from storage backend (S3 redirect or local)
+            return _serve_from_storage_or_fail()
         finally:
             c.close()
     except HTTPException:

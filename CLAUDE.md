@@ -401,6 +401,21 @@ GET    /health                  -- public
 - **ChromaDB pruner**: Daily orphan vector cleanup + cascade delete.
 - **Email-only login**: simplified auth surface — frontend locked to `type=email`, backend rejects non-email identifiers and ignores PIN. `.env.example` cleaned (no more `SUPER_ADMIN_PHONE`/`SUPER_ADMIN_PIN`).
 
+## Storage backend
+
+`storage.py` — pluggable file storage. Single API: `save_file`, `save_bytes`, `open_stream`, `get_local_path`, `delete`, `delete_prefix`, `exists`, `presigned_url`, `backend_name`.
+
+| `STORAGE_BACKEND` | Behavior |
+|-------------------|----------|
+| `local` (default) | writes to `data/uploads/` on disk, FastAPI streams via FileResponse |
+| `s3` | writes to AWS S3 / R2 / B2 / MinIO / Wasabi; image serve redirects to presigned URL (10-min expiry) |
+
+Upload path: write to local `batch_dir` (always — pipeline needs local file for PIL/QR/EXIF), then `storage.save_file()` mirrors to remote. For local backend this is a no-op (same path).
+
+Migration (`migrate_to_s3.py`): walks existing `data/uploads/` and pushes each file. Idempotent — skips via `head_object`. Run once after switching backend.
+
+Cascading delete: `/api/batch/{id}` removes from SQLite + Chroma + `storage.delete_prefix(batch_id)`.
+
 ## Pitfalls / things to know
 
 - **Login is email + password only** — phone/PIN paths removed. `users.pin_hash` still exists in DB but never read by login. Don't re-enable PIN auth without also tightening rate limits (4-digit space is brute-forceable).

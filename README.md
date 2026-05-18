@@ -246,6 +246,45 @@ curl -c jar -X POST localhost:8090/api/auth/login -H 'Content-Type: application/
 cd frontend && npm run dev
 ```
 
+## Storage backend (local or S3)
+
+`STORAGE_BACKEND=local` (default) — uploads live in `data/uploads/` on disk.
+
+`STORAGE_BACKEND=s3` — mirror every upload to S3-compatible storage. Works with:
+- AWS S3
+- Cloudflare R2 (`S3_ENDPOINT_URL=https://<account>.r2.cloudflarestorage.com`)
+- Backblaze B2 (`S3_ENDPOINT_URL=https://s3.<region>.backblazeb2.com`)
+- MinIO (`S3_ENDPOINT_URL=http://minio:9000`)
+- Wasabi
+
+Image serve returns a presigned URL (10-min expiry) instead of streaming the file → CDN-friendly, multi-container safe.
+
+```bash
+# .env additions
+STORAGE_BACKEND=s3
+S3_BUCKET=my-kontact-uploads
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+S3_REGION=us-east-1
+S3_ENDPOINT_URL=                 # blank = AWS; set for R2/B2/MinIO
+S3_PREFIX=prod/                  # optional
+S3_PUBLIC_BASE_URL=              # set if bucket is public (skips presign)
+
+# Migrate existing local uploads to S3 (one-time, idempotent)
+docker compose exec kontact python3 migrate_to_s3.py
+```
+
+Cascading: deleting a batch removes both DB rows AND the S3 prefix.
+
+## Backup + restore
+
+```bash
+./backup.sh                       # → backups/kontact-backup-YYYYMMDD-HHMMSS.tar.gz
+./restore.sh <archive>            # restore on any server
+```
+
+Captures: SQLite DB (WAL-checkpointed) + ChromaDB + uploads + extractions + `.env`. See [`CLAUDE.md`](CLAUDE.md) for full details.
+
 ## License
 
 MIT.
