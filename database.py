@@ -172,6 +172,19 @@ def _migrate_columns(c):
     _add_column(c, "products", "source_channel TEXT DEFAULT 'upload'")
     _add_column(c, "products", "edit_count INTEGER DEFAULT 0")
 
+    # Trade-show grouping
+    _add_column(c, "documents", "trade_show TEXT")
+    _add_column(c, "queue", "trade_show TEXT")
+    try:
+        c.execute("CREATE INDEX IF NOT EXISTS idx_docs_trade_show ON documents(trade_show)")
+        c.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Currency separation on products
+    _add_column(c, "products", "currency TEXT")
+    _add_column(c, "products", "price_amount REAL")
+
     _add_column(c, "queue", "updated_at TEXT")
     _add_column(c, "queue", "source_channel TEXT DEFAULT 'upload'")
 
@@ -867,6 +880,7 @@ def insert_extraction(folder: str, record: dict, owner_uuid: str = None, is_shar
     is_blurry_v = 1 if mx.get("is_blurry") else 0
     near_dup_of = mx.get("near_dup_of")
     device_signals = mx.get("device_signals")
+    trade_show = mx.get("trade_show")
 
     c.execute("""
         INSERT OR REPLACE INTO documents
@@ -879,9 +893,9 @@ def insert_extraction(folder: str, record: dict, owner_uuid: str = None, is_shar
          lens_model, focal_length, f_number, iso, exposure_time, software, sub_sec_time,
          client_timezone, client_user_agent, client_ip, client_timestamp,
          image_phash, blur_score, is_blurry, near_dup_of, device_signals,
-         updated_at, edit_count)
+         updated_at, edit_count, trade_show)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         folder,
         record.get("source_file", ""),
@@ -904,7 +918,7 @@ def insert_extraction(folder: str, record: dict, owner_uuid: str = None, is_shar
         lens_model, focal_length, f_number, iso_v, exposure_time, software, sub_sec_time,
         client_timezone, client_user_agent, client_ip, client_timestamp,
         image_phash, blur_score, is_blurry_v, near_dup_of, device_signals,
-        _now, 0,
+        _now, 0, trade_show,
     ))
     doc_id = c.execute("SELECT id FROM documents WHERE folder = ? AND source_file = ?",
                        (folder, record.get("source_file", ""))).fetchone()
@@ -927,19 +941,27 @@ def insert_extraction(folder: str, record: dict, owner_uuid: str = None, is_shar
             specs_val = p.get("specs", "")
             if not isinstance(specs_val, str):
                 specs_val = json.dumps(specs_val, ensure_ascii=False)
+            price_str = p.get("price", "")
+            # Parse currency + numeric amount for filtering/aggregation
+            try:
+                from pipeline.pricing import parse_price as _parse_price
+                ccy, amt = _parse_price(price_str)
+            except Exception:
+                ccy, amt = None, None
             try:
                 c.execute("""
                     INSERT INTO products (uuid, document_uuid, document_id, folder, source_file, company, name, model, specs, category, price, image_desc, owner_uuid, is_shared,
-                                          source_channel, updated_at, edit_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          source_channel, updated_at, edit_count, currency, price_amount)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     str(uuid4()), doc_uuid, doc_id, folder, source_file,
                     p.get("company", "") or company,
                     p_name, p.get("model", ""), specs_val,
-                    p.get("category", ""), p.get("price", ""),
+                    p.get("category", ""), price_str,
                     p.get("image_desc", "") or p.get("description", ""),
                     owner_uuid, int(bool(is_shared)),
                     source_channel_val, _now, 0,
+                    ccy, amt,
                 ))
             except Exception:
                 pass  # Skip duplicates
@@ -1107,18 +1129,20 @@ def delete_session(session_id: str):
 
 def queue_add(batch_id: str, file_name: str, file_path: str,
               source_channel: str = None, source_sender: str = None, file_hash: str = None,
-              owner_uuid: str = None):
+              owner_uuid: str = None, trade_show: str = None):
     c = _conn()
-    for col_def in ["source_channel TEXT", "source_sender TEXT", "file_hash TEXT", "owner_uuid TEXT"]:
+    for col_def in ["source_channel TEXT", "source_sender TEXT", "file_hash TEXT",
+                    "owner_uuid TEXT", "trade_show TEXT"]:
         try:
             c.execute(f"ALTER TABLE queue ADD COLUMN {col_def}")
             c.commit()
         except sqlite3.OperationalError:
             pass
     c.execute(
-        "INSERT INTO queue (batch_id, file_name, file_path, source_channel, source_sender, file_hash, owner_uuid) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (batch_id, file_name, file_path, source_channel, source_sender, file_hash, owner_uuid),
+        "INSERT INTO queue (batch_id, file_name, file_path, source_channel, source_sender, "
+        "file_hash, owner_uuid, trade_show) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (batch_id, file_name, file_path, source_channel, source_sender,
+         file_hash, owner_uuid, trade_show),
     )
     c.commit()
     c.close()

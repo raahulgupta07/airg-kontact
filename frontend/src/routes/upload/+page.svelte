@@ -194,6 +194,17 @@
     return URL.createObjectURL(file);
   }
 
+  // Persisted trade-show name (autofills next upload)
+  let tradeShow = $state('');
+  if (typeof window !== 'undefined') {
+    try { tradeShow = localStorage.getItem('kontact-trade-show') || ''; } catch {}
+  }
+  $effect(() => {
+    if (typeof window !== 'undefined') {
+      try { localStorage.setItem('kontact-trade-show', tradeShow); } catch {}
+    }
+  });
+
   async function upload() {
     if (files.length === 0 || uploading === 'uploading') return;
     uploading = 'uploading';
@@ -204,6 +215,7 @@
       for (const file of files) {
         formData.append('files', file);
       }
+      if (tradeShow.trim()) formData.append('trade_show', tradeShow.trim());
 
       // Capture client geolocation + metadata
       uploadAttempted = true;
@@ -281,6 +293,15 @@
   <header class="page-head">
     <h1 class="page-title">Upload</h1>
     <p class="page-sub">Snap or drop catalog pages, PDFs, or images.</p>
+    <label class="show-input">
+      <span>Trade show / batch label (optional)</span>
+      <input
+        type="text"
+        placeholder="e.g. Canton Fair 2026, CES 2026"
+        bind:value={tradeShow}
+        maxlength="80"
+      />
+    </label>
   </header>
 
   {#if !online}
@@ -451,6 +472,33 @@
   .page-head { margin-bottom: 4px; }
   .page-title { font-size: 24px; font-weight: 600; color: var(--text); margin: 0; letter-spacing: 0; }
   .page-sub { font-size: 14px; color: var(--text-muted); margin: 4px 0 0; }
+  .show-input {
+    display: block;
+    margin: 14px 0 0;
+  }
+  .show-input span {
+    display: block;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .show-input input {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+  }
+  .show-input input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
 
   .banner {
     padding: 10px 14px;

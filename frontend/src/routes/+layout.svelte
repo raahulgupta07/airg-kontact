@@ -29,13 +29,41 @@
     goto(path);
   }
 
+  // PWA install prompt
+  let deferredInstall: any = $state(null);
+  let showInstall = $state(false);
+  const INSTALL_DISMISS_KEY = 'kontact-install-dismissed';
+
   onMount(async () => {
     initTheme();
     await auth.refresh();
     if (!auth.user && !isLoginRoute) {
       goto('/login');
     }
+
+    // PWA install hook
+    try {
+      const dismissed = localStorage.getItem(INSTALL_DISMISS_KEY);
+      window.addEventListener('beforeinstallprompt', (e: any) => {
+        e.preventDefault();
+        deferredInstall = e;
+        if (!dismissed) showInstall = true;
+      });
+    } catch {}
   });
+
+  async function triggerInstall() {
+    if (!deferredInstall) return;
+    deferredInstall.prompt();
+    try { await deferredInstall.userChoice; } catch {}
+    deferredInstall = null;
+    showInstall = false;
+  }
+
+  function dismissInstall() {
+    showInstall = false;
+    try { localStorage.setItem(INSTALL_DISMISS_KEY, '1'); } catch {}
+  }
 
   // Reactive guard: kick out if session disappears
   $effect(() => {
@@ -60,6 +88,15 @@
 {:else if !auth.user}
   <div class="loading-shell">Redirecting…</div>
 {:else}
+{#if showInstall}
+  <div class="install-banner" role="region" aria-label="Install Kontact">
+    <span>Install Kontact for one-tap camera access</span>
+    <div class="install-actions">
+      <button class="install-btn" onclick={triggerInstall}>Install</button>
+      <button class="install-dismiss" onclick={dismissInstall} aria-label="dismiss">×</button>
+    </div>
+  </div>
+{/if}
 <div class="app-shell">
   <!-- Desktop Sidebar -->
   <aside class="sidebar">
@@ -636,5 +673,42 @@
     .nav-bottom button span {
       display: none;
     }
+  }
+
+  .install-banner {
+    position: fixed;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface);
+    border: 1px solid var(--accent);
+    border-radius: var(--r-lg, 12px);
+    padding: 10px 14px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+    z-index: 100;
+    font-size: 14px;
+    max-width: 90vw;
+  }
+  .install-actions { display: flex; gap: 8px; align-items: center; }
+  .install-btn {
+    background: var(--accent);
+    color: white;
+    border: none;
+    padding: 6px 14px;
+    border-radius: var(--r-md, 8px);
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .install-dismiss {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
   }
 </style>

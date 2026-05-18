@@ -283,6 +283,7 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
 
     # ── Read optional client_* form fields (browser-side geo + UA) ──
     form = await request.form()
+    trade_show = (form.get("trade_show") or "").strip() or None
 
     def _f(name):
         v = form.get(name)
@@ -394,7 +395,7 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
                 page_name = f"{base_name}_page{i}.jpg"
                 page_dest = os.path.join(batch_dir, page_name)
                 img.save(page_dest, format="JPEG", quality=90)
-                db.queue_add(batch_id, page_name, page_dest, owner_uuid=user["uuid"])
+                db.queue_add(batch_id, page_name, page_dest, owner_uuid=user["uuid"], trade_show=trade_show)
                 # Mirror to remote storage (no-op for local backend)
                 try:
                     storage.save_file(upload_key(batch_id, page_name), page_dest, "image/jpeg")
@@ -403,7 +404,7 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
                 queued.append(page_name)
             doc.close()
         else:
-            db.queue_add(batch_id, safe_name, dest, owner_uuid=user["uuid"])
+            db.queue_add(batch_id, safe_name, dest, owner_uuid=user["uuid"], trade_show=trade_show)
             try:
                 storage.save_file(upload_key(batch_id, safe_name), dest, f.content_type or None)
             except Exception as _se:
@@ -744,8 +745,32 @@ async def _process_batch(batch_id: str = None, owner_uuid: str = None, client_me
                 _src_ch = "upload"
             mx["source_channel"] = _src_ch
 
+            # Trade-show passthrough from queue row
+            if item.get("trade_show"):
+                mx["trade_show"] = item["trade_show"]
+
             db.insert_extraction(folder, r, owner_uuid=doc_owner, is_shared=0, metadata_extra=mx)
             vs.index_record(folder, r)
+
+            # AI auto-tagging — best-effort, heuristic (no extra LLM call)
+            try:
+                from pipeline.tagger import suggest_tags
+                tags = suggest_tags({**r, "metadata": {**mx, **(r.get("metadata") or {})}})
+                if tags:
+                    with db.db() as _c:
+                        # Get doc uuid we just inserted
+                        row = _c.execute(
+                            "SELECT uuid FROM documents WHERE folder = ? AND source_file = ?",
+                            (folder, r.get("source_file", "")),
+                        ).fetchone()
+                        if row:
+                            doc_uuid = row["uuid"]
+                            for tname in tags:
+                                tag_uuid = db.create_tag(_c, tname, user_uuid=doc_owner)
+                                db.tag_document(_c, doc_uuid, tag_uuid, user_uuid=doc_owner)
+            except Exception as _e:
+                print(f"[tagger] error for {fname}: {_e}")
+
             done_count += 1
 
     # Save JSON
@@ -792,8 +817,50 @@ def semantic_search(q: str = Query(...), n: int = 5, user=Depends(current_user))
 # ─── DATA ───
 
 @app.get("/api/data")
-def get_data(folder: str = None, limit: int = 500, user=Depends(current_user)):
-    return db.get_documents_visible(user, folder=folder, limit=limit)
+def get_data(
+    folder: str = None,
+    limit: int = 500,
+    trade_show: str = None,
+    country: str = None,
+    has_qr: int = None,
+    has_gps: int = None,
+    user=Depends(current_user),
+):
+    rows = db.get_documents_visible(user, folder=folder, limit=limit)
+    # Server-side post-filter (cheap; <500 rows typically)
+    if trade_show:
+        rows = [r for r in rows if (r.get("trade_show") or "").lower() == trade_show.lower()]
+    if country:
+        rows = [r for r in rows if (r.get("country") or "").lower() == country.lower()]
+    if has_qr is not None:
+        if has_qr:
+            rows = [r for r in rows if r.get("qr_payloads")]
+        else:
+            rows = [r for r in rows if not r.get("qr_payloads")]
+    if has_gps is not None:
+        if has_gps:
+            rows = [r for r in rows if r.get("gps_lat") is not None]
+        else:
+            rows = [r for r in rows if r.get("gps_lat") is None]
+    return rows
+
+
+@app.get("/api/aggregations/trade-shows")
+def agg_trade_shows(user=Depends(current_user)):
+    """List distinct trade-show labels visible to user with doc count."""
+    vc, vp = db.visibility_clause("", user)
+    where = "WHERE trade_show IS NOT NULL AND trade_show != ''"
+    if vc:
+        where += f" AND {vc}"
+    c = db._conn()
+    try:
+        rows = c.execute(
+            f"SELECT trade_show, COUNT(*) AS doc_count FROM documents {where} "
+            f"GROUP BY trade_show ORDER BY doc_count DESC", vp,
+        ).fetchall()
+    finally:
+        c.close()
+    return [dict(r) for r in rows]
 
 
 @app.get("/api/documents/{doc_id}")
@@ -864,12 +931,82 @@ def get_contacts(user=Depends(current_user)):
     return db.get_contacts_table_visible(user)
 
 
+@app.get("/api/contacts/duplicates")
+def contact_duplicates(user=Depends(current_user)):
+    """Suggest merge candidates: same phone_e164 OR same email."""
+    vc, vp = db.visibility_clause("", user)
+    where = f"WHERE {vc}" if vc else ""
+    c = db._conn()
+    try:
+        rows = c.execute(
+            f"SELECT uuid, person, company, phone_e164, email FROM contacts {where}", vp
+        ).fetchall()
+    finally:
+        c.close()
+    by_phone: dict = {}
+    by_email: dict = {}
+    for r in rows:
+        p = (r["phone_e164"] or "").strip()
+        e = (r["email"] or "").strip().lower()
+        if p:
+            by_phone.setdefault(p, []).append(dict(r))
+        if e:
+            by_email.setdefault(e, []).append(dict(r))
+    groups = []
+    seen = set()
+    for k, grp in {**by_phone, **by_email}.items():
+        if len(grp) < 2:
+            continue
+        key = tuple(sorted(c["uuid"] for c in grp))
+        if key in seen:
+            continue
+        seen.add(key)
+        groups.append({"match": k, "contacts": grp})
+    return groups
+
+
 @app.get("/api/contacts/{uuid}")
 def get_contact_one(uuid: str, user=Depends(current_user)):
     ct = db.get_contact_visible(uuid, user)
     if not ct:
         raise HTTPException(404, "contact not found")
     return ct
+
+
+def _build_vcard_legacy_unused(ct: dict) -> str:
+    """(Superseded by lib/vcard.to_vcard at line ~1565.) Kept dead for ref."""
+    def esc(v):
+        if v is None:
+            return ""
+        return str(v).replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
+    lines = ["BEGIN:VCARD", "VERSION:3.0"]
+    name = esc(ct.get("person") or "")
+    if name:
+        # FN is full name; N is structured (Family;Given;...)
+        parts = name.split(" ", 1)
+        family = parts[-1] if len(parts) > 1 else ""
+        given = parts[0] if len(parts) > 1 else name
+        lines.append(f"N:{esc(family)};{esc(given)};;;")
+        lines.append(f"FN:{name}")
+    if ct.get("company"):
+        lines.append(f"ORG:{esc(ct['company'])}")
+    if ct.get("phone_e164") or ct.get("phone"):
+        lines.append(f"TEL;TYPE=CELL:{esc(ct.get('phone_e164') or ct.get('phone'))}")
+    if ct.get("email"):
+        lines.append(f"EMAIL;TYPE=WORK:{esc(ct['email'])}")
+    if ct.get("website"):
+        lines.append(f"URL:{esc(ct['website'])}")
+    if ct.get("address"):
+        lines.append(f"ADR;TYPE=WORK:;;{esc(ct['address'])};;;;")
+    # Messenger handles as X- entries
+    for plat, col in (("whatsapp", "whatsapp"), ("wechat", "wechat_id"),
+                      ("telegram", "telegram"), ("line", "line_id"),
+                      ("viber", "viber"), ("signal", "signal_phone")):
+        v = ct.get(col)
+        if v:
+            lines.append(f"X-{plat.upper()}:{esc(v)}")
+    lines.append("END:VCARD")
+    return "\r\n".join(lines)
 
 
 @app.get("/api/products")
