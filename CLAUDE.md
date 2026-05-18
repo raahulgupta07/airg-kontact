@@ -4,7 +4,7 @@
 
 KONTACT is a **multi-tenant catalog vision RAG agent** — snap photos of product catalogs and contact QRs at trade shows, extract structured data with multi-agent AI vision, and chat with an intelligent agent that runs SQL queries, remembers facts, cites sources with images, and knows who you met.
 
-**Hardened, production-shape**: 24 security/bug fixes landed (5 CRITICAL, 8 HIGH, 5 MEDIUM, 4 functional bugs, 2 features) — see "Hardening landmarks" below.
+**Hardened, production-shape**: 25 security/bug fixes/features landed (5 CRITICAL, 8 HIGH, 5 MEDIUM, 4 functional bugs, 3 features) — see "Hardening landmarks" below.
 
 **Architecture**:
 ```
@@ -53,7 +53,7 @@ City-KONTACT/
 │   │   └── components/         # 13 components: tables, gallery, LocationsMap, Timeline, Tags, Notes, etc.
 │   └── routes/
 │       ├── +layout.svelte      # Desktop sidebar + mobile bottom nav
-│       ├── login/              # email/phone + password/PIN + show-pw + remember
+│       ├── login/              # email + password only + show-pw + remember
 │       ├── upload/             # 3 inputs (camera/library/files) + exifr + geo capture
 │       ├── queue/              # Batch list, retry, delete, toast
 │       ├── chat/               # Streaming SSE + tool steps + citations + feedback + voice
@@ -71,7 +71,7 @@ City-KONTACT/
 
 ```sql
 -- Identity + access
-users               -- uuid, email, phone_e164, password_hash, pin_hash, role, is_active
+users               -- uuid, email, phone_e164 (contact-only), password_hash, pin_hash (unused), role, is_active
 login_attempts      -- throttle log (5 fails/15min → 30min lockout)
 audit_events        -- upload/login/edit/delete/share/merge
 
@@ -113,6 +113,24 @@ company, person, phone, phone_e164, email, website, address
 whatsapp, wechat_id, wechat_qr_url, viber, telegram, line_id, signal_phone
 messengers (JSON), owner_uuid, source_channel
 ```
+
+## Auth model
+
+**Email + password only.** Login at `/login`; backend `/api/auth/login` rejects non-email identifiers and ignores `pin_hash`.
+
+| Layer | Detail |
+|-------|--------|
+| Frontend | `<input type="email" autocomplete="email">` — browser validates |
+| Backend | `normalize_identifier()` must return `kind="email"`; phone identifier → 401 |
+| Password | bcrypt 4.0.1 via passlib; PIN field on user table is unused |
+| Session | HttpOnly cookie `kontact_session`, 14-day, itsdangerous-signed |
+| Lockout | 5 fails / 15min → 30min cooldown (`is_locked()`) |
+| Rate limit | 10/min per-IP via slowapi |
+| Legacy | `payload.get('email')` and `payload.get('password')` accepted alongside `{identifier, secret}` |
+
+Phone column (`users.phone_e164`) kept as contact info, not auth. PIN column (`pin_hash`) is dead schema (kept to avoid migration churn).
+
+Super admin bootstrap: `auth.bootstrap_super_admin()` reads `.env` on startup, creates/updates the row.
 
 ## Tenancy model
 
@@ -292,7 +310,7 @@ GET    /health                  -- public
 
 | Route | Purpose |
 |-------|---------|
-| `/login` | email/phone+password/PIN, show-pw, remember-me (localStorage base64) |
+| `/login` | email + password only, show-pw toggle, remember-me (localStorage base64) |
 | `/upload` | hero camera + 3 inputs (camera capture / library / files), exifr@7.1.3, browser geo, sticky upload bar |
 | `/queue` | batch rows, inline thumbnails, retry/delete, toast, terminal |
 | `/chat` | SSE streaming, RAG ANALYZING animation, tool steps, image citations, thumbs feedback, voice input, export |
@@ -330,7 +348,9 @@ GET    /health                  -- public
 |----------|---------|----------|---------|
 | `OPENROUTER_API_KEY` | — | YES | LLM |
 | `SESSION_SECRET` | — | YES, ≥32 chars | Fails startup if missing/placeholder |
-| `SUPER_ADMIN_EMAIL/PHONE/PASSWORD/PIN/NAME` | — | YES (one of email/phone + one of pw/pin) | Bootstrap |
+| `SUPER_ADMIN_EMAIL` | — | YES | Bootstrap admin email (used for login) |
+| `SUPER_ADMIN_PASSWORD` | — | YES | Bootstrap admin password |
+| `SUPER_ADMIN_NAME` | `Super Admin` | | Display name |
 | `SESSION_DAYS` | 14 | | Cookie lifetime |
 | `COOKIE_SECURE` | auto | | `true` for HTTPS prod |
 | `CORS_ORIGINS` | http://localhost:8090 | | Comma-separated; `*` disables credentials |
@@ -376,12 +396,14 @@ GET    /health                  -- public
 - **Messengers agg empty**: Read flat platform cols (whatsapp/wechat_qr_url/viber/telegram/line_id/signal_phone) in addition to messengers JSON.
 - **WhatsApp invite parser**: `wa.me/qr/CODE` was extracting "qr" as phone. Now detects `/qr/<code>` and `/message/<code>` patterns, stores `invite_code`, leaves phone null.
 
-### ✨ 2 features
+### ✨ 3 features
 - **URL profile resolver**: SSRF-safe HTTP fetch + JSON-LD/OG/microdata/regex extraction. URL-type QRs now enrich contacts (test: GitHub QR → "Linus Torvalds" + "GitHub").
 - **ChromaDB pruner**: Daily orphan vector cleanup + cascade delete.
+- **Email-only login**: simplified auth surface — frontend locked to `type=email`, backend rejects non-email identifiers and ignores PIN. `.env.example` cleaned (no more `SUPER_ADMIN_PHONE`/`SUPER_ADMIN_PIN`).
 
 ## Pitfalls / things to know
 
+- **Login is email + password only** — phone/PIN paths removed. `users.pin_hash` still exists in DB but never read by login. Don't re-enable PIN auth without also tightening rate limits (4-digit space is brute-forceable).
 - **Bcrypt 4.0.1 PINNED** — passlib 1.7.4 breaks with bcrypt 5.x ("password cannot be longer than 72 bytes")
 - **INSERT OR REPLACE deleted** — FK to products/contacts cascades to constraint failure. Use upsert by `(folder, source_file)` only.
 - **`file_hash` index** — now plain (not UNIQUE) to avoid REPLACE collision when same image uploaded in different batches

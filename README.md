@@ -45,16 +45,24 @@ docker compose --profile https up -d
 
 ## Auth
 
-| Identifier | Secret |
-|------------|--------|
-| email | password |
-| email | PIN |
-| phone (E.164 or `+86xxxxxxxxx`) | password |
-| phone | PIN |
+**Email + password only.** Phone/PIN auth removed for simplicity.
+
+| Field | Note |
+|-------|------|
+| Email | normalized lowercase; `type=email` browser validation |
+| Password | bcrypt 4.0.1 (passlib pinned) |
 
 Session = HttpOnly cookie, 14-day, signed (itsdangerous), HTTPS-secure when `COOKIE_SECURE=true`.
 
 5 fails in 15 min → 30-min lockout. Rate limits: 10/min login, 30/min upload, 60/min chat.
+
+Bootstrap super admin from `.env` on first start:
+```bash
+SUPER_ADMIN_EMAIL=admin@yourdomain.com
+SUPER_ADMIN_PASSWORD=<strong>
+SUPER_ADMIN_NAME=Your Name
+```
+Additional users created via `/users` admin UI (also email + password only).
 
 ## Architecture
 
@@ -212,7 +220,7 @@ SvelteKit 5 + Tailwind v4 + Svelte 5 runes. Routes:
 | `SESSION_DAYS` | 14 | cookie lifetime |
 | `COOKIE_SECURE` | auto | `true` in prod (HTTPS) |
 | `CORS_ORIGINS` | localhost | comma-separated, no wildcard w/ credentials |
-| `SUPER_ADMIN_{EMAIL,PHONE,PASSWORD,PIN,NAME}` | — | bootstrap |
+| `SUPER_ADMIN_{EMAIL,PASSWORD,NAME}` | — | bootstrap |
 | `MAX_UPLOAD_BYTES` | 104857600 | 100MB per file |
 | `MAX_IMAGE_PIXELS` | 100000000 | PIL bomb guard |
 | `RATE_LIMIT_ENABLED` | true | slowapi toggle |
