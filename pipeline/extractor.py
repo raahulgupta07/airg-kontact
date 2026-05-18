@@ -56,15 +56,68 @@ def merge_qr_into_data(data: dict, qr_codes: list) -> dict:
         elif qr_type == "wechat" and not contact.get("wechat_qr_url"):
             contact["wechat_qr_url"] = raw
 
-    # vCard overlay — authoritative
+        # Communication-only QRs fill contact gaps
+        elif qr_type == "tel" and not contact.get("phone"):
+            contact["phone"] = parsed.get("phone") or raw
+        elif qr_type == "email" and not contact.get("email"):
+            if parsed.get("email"):
+                contact["email"] = parsed["email"]
+        elif qr_type == "sms":
+            if not contact.get("phone") and parsed.get("phone"):
+                contact["phone"] = parsed["phone"]
+
+        # GeoURL → page-level GPS (overrides only if EXIF missing)
+        elif qr_type == "geo":
+            data.setdefault("metadata", {})
+            if data["metadata"].get("gps_lat") is None and parsed.get("gps_lat") is not None:
+                data["metadata"]["gps_lat"] = parsed["gps_lat"]
+                data["metadata"]["gps_lng"] = parsed["gps_lng"]
+                data["metadata"]["gps_source"] = "qr_geo"
+
+        # VEVENT → meeting record (created downstream by main.py)
+        elif qr_type == "vevent":
+            data.setdefault("meetings", []).append({
+                "title": parsed.get("title"),
+                "location": parsed.get("location"),
+                "when_at": parsed.get("start"),
+                "end_at": parsed.get("end"),
+                "description": parsed.get("description"),
+                "organizer": parsed.get("organizer"),
+            })
+
+        # WiFi → metadata only (not contact)
+        elif qr_type == "wifi":
+            data.setdefault("metadata", {})["wifi"] = {
+                "ssid": parsed.get("ssid"),
+                "auth": parsed.get("auth"),
+                "hidden": parsed.get("hidden"),
+                # NOTE: do not expose plaintext password in flat columns
+                "password_present": bool(parsed.get("password")),
+            }
+
+        # Payments (EPC/UPI/PIX/crypto) → metadata, not contact
+        elif qr_type in ("epc", "upi", "pix", "bitcoin", "ethereum"):
+            data.setdefault("metadata", {}).setdefault("payments", []).append({
+                "type": qr_type,
+                **parsed,
+            })
+
+        # Barcode (1D EAN/UPC/Code128 etc.) → product hint
+        elif qr_type == "barcode":
+            data.setdefault("metadata", {}).setdefault("barcodes", []).append({
+                "code": parsed.get("code") or raw,
+                "symbology": parsed.get("symbology"),
+            })
+
+    # vCard / MeCard overlay — authoritative for contact
     for qr in qr_codes:
-        if qr.get("type") == "vcard":
-            vcard = qr.get("parsed") or {}
-            for k, v in vcard.items():
+        if qr.get("type") in ("vcard", "mecard"):
+            card = qr.get("parsed") or {}
+            for k, v in card.items():
                 if v:
                     contact[k] = v
-            if vcard.get("company") and not data.get("company"):
-                data["company"] = vcard["company"]
+            if card.get("company") and not data.get("company"):
+                data["company"] = card["company"]
 
     if messengers:
         data["messengers"] = messengers

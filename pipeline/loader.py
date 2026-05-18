@@ -241,7 +241,7 @@ _QR_PATTERNS = [
     ("telegram",       re.compile(r"^(https?://)?(t\.me|telegram\.me|tg://)", re.I)),
     ("line",           re.compile(r"^(https?://)?(line\.me|lin\.ee|line://)", re.I)),
     ("signal",         re.compile(r"^(https?://)?signal\.(me|group)|sgnl://", re.I)),
-    ("kakao",          re.compile(r"^(https?://)?(open\.kakao\.com|qr\.kakao\.com|kakaotalk://)", re.I)),
+    ("kakao",          re.compile(r"^(https?://)?(open\.kakao\.com|qr\.kakao\.com|kakaotalk://|pf\.kakao\.com)", re.I)),
     ("wechat",         re.compile(r"^(https?://)?(weixin\.qq\.com|u\.wechat\.com|wxp://|weixin://)", re.I)),
     ("skype",          re.compile(r"^(skype:|https?://join\.skype\.com)", re.I)),
     ("zalo",           re.compile(r"^(https?://)?(zalo\.me|zalo://)", re.I)),
@@ -249,13 +249,26 @@ _QR_PATTERNS = [
     ("instagram",      re.compile(r"^(https?://)?(www\.)?instagram\.com/", re.I)),
     ("snapchat",       re.compile(r"^(https?://)?(www\.)?snapchat\.com/add/", re.I)),
     ("discord",        re.compile(r"^(https?://)?(discord\.gg|discord\.com/invite)", re.I)),
+    ("threads",        re.compile(r"^(https?://)?(www\.)?threads\.net/@", re.I)),
+    # Contact + identity
     ("vcard",          re.compile(r"^BEGIN:VCARD", re.I)),
     ("mecard",         re.compile(r"^MECARD:", re.I)),
+    # Communication
     ("tel",            re.compile(r"^tel:", re.I)),
     ("email",          re.compile(r"^(mailto:|MATMSG:)", re.I)),
     ("sms",            re.compile(r"^sms(to)?:", re.I)),
+    # Connectivity + location
     ("wifi",           re.compile(r"^WIFI:", re.I)),
     ("geo",            re.compile(r"^geo:", re.I)),
+    # Calendar
+    ("vevent",         re.compile(r"^BEGIN:V(EVENT|CALENDAR)", re.I)),
+    # Payments
+    ("epc",            re.compile(r"^BCD\r?\n", re.I)),                            # SEPA EPC069-12
+    ("upi",            re.compile(r"^upi://", re.I)),                              # India UPI
+    ("pix",            re.compile(r"^00020126|^br\.gov\.bcb\.pix", re.I)),         # Brazil PIX EMV
+    ("bitcoin",        re.compile(r"^bitcoin:", re.I)),
+    ("ethereum",       re.compile(r"^ethereum:", re.I)),
+    # Fallback
     ("url",            re.compile(r"^https?://", re.I)),
 ]
 
@@ -459,6 +472,232 @@ def parse_messenger_qr(qr_type: str, raw: str) -> dict:
     return out
 
 
+def parse_tel(raw: str) -> dict:
+    """tel:+1234567890;ext=42"""
+    s = raw.strip()
+    if s.lower().startswith("tel:"):
+        s = s[4:]
+    s = s.split(";")[0].split("?")[0]
+    out = {"phone": _normalize_phone(s) or s, "raw_phone": s}
+    return out
+
+
+def parse_email_qr(raw: str) -> dict:
+    """mailto:foo@bar.com?subject=...&body=...
+    MATMSG:TO:foo@bar.com;SUB:hi;BODY:hello;;
+    """
+    out = {"email": None, "subject": None, "body": None, "cc": None, "bcc": None}
+    s = raw.strip()
+    if s.lower().startswith("mailto:"):
+        rest = s[7:]
+        addr, _, qs = rest.partition("?")
+        out["email"] = unquote(addr).split(",")[0]
+        for kv in qs.split("&"):
+            k, _, v = kv.partition("=")
+            k = k.lower()
+            v = unquote(v)
+            if k == "subject":
+                out["subject"] = v
+            elif k == "body":
+                out["body"] = v
+            elif k == "cc":
+                out["cc"] = v
+            elif k == "bcc":
+                out["bcc"] = v
+    elif s.upper().startswith("MATMSG:"):
+        body = s[7:].rstrip(";").rstrip(";")
+        for field in body.split(";"):
+            if ":" not in field:
+                continue
+            k, _, v = field.partition(":")
+            k = k.upper()
+            if k == "TO":
+                out["email"] = v
+            elif k == "SUB":
+                out["subject"] = v
+            elif k == "BODY":
+                out["body"] = v
+    return out
+
+
+def parse_sms(raw: str) -> dict:
+    """smsto:+86138...:hello   sms:+86138...?body=hi"""
+    out = {"phone": None, "body": None}
+    s = raw.strip()
+    low = s.lower()
+    if low.startswith("smsto:"):
+        rest = s[6:]
+        phone, _, body = rest.partition(":")
+        out["phone"] = _normalize_phone(phone) or phone
+        out["body"] = body or None
+    elif low.startswith("sms:"):
+        rest = s[4:]
+        phone, _, qs = rest.partition("?")
+        out["phone"] = _normalize_phone(phone) or phone
+        for kv in qs.split("&"):
+            k, _, v = kv.partition("=")
+            if k.lower() == "body":
+                out["body"] = unquote(v)
+    return out
+
+
+def parse_wifi(raw: str) -> dict:
+    """WIFI:T:WPA;S:SSID;P:password;H:true;;"""
+    out = {"ssid": None, "auth": None, "password": None, "hidden": False}
+    s = raw.strip()
+    if s.upper().startswith("WIFI:"):
+        s = s[5:]
+    if s.endswith(";;"):
+        s = s[:-2]
+    # Split by unescaped ;
+    parts = re.split(r"(?<!\\);", s)
+    for field in parts:
+        if ":" not in field:
+            continue
+        k, _, v = field.partition(":")
+        k = k.upper().strip()
+        v = v.replace(r"\;", ";").replace(r"\,", ",").replace(r"\:", ":").replace(r"\\", "\\")
+        if k == "T":
+            out["auth"] = v.upper() or None
+        elif k == "S":
+            out["ssid"] = v or None
+        elif k == "P":
+            out["password"] = v or None
+        elif k == "H":
+            out["hidden"] = v.lower() == "true"
+    return out
+
+
+def parse_geo(raw: str) -> dict:
+    """geo:31.2304,121.4737?q=Some+Place  or  geo:31.2,121.4;u=20"""
+    out = {"gps_lat": None, "gps_lng": None, "label": None}
+    s = raw.strip()
+    if s.lower().startswith("geo:"):
+        s = s[4:]
+    coords_part, _, qs = s.partition("?")
+    coords = coords_part.split(";")[0]
+    try:
+        lat_s, lng_s = coords.split(",")[:2]
+        out["gps_lat"] = float(lat_s)
+        out["gps_lng"] = float(lng_s)
+    except (ValueError, IndexError):
+        pass
+    for kv in qs.split("&"):
+        k, _, v = kv.partition("=")
+        if k.lower() == "q":
+            out["label"] = unquote(v)
+    return out
+
+
+def parse_vevent(raw: str) -> dict:
+    """BEGIN:VEVENT...END:VEVENT — iCalendar event.
+
+    Extract summary, location, start, end, description.
+    Datetimes left as raw strings (ISO-ish) — caller can parse if needed.
+    """
+    out = {"title": None, "location": None, "start": None, "end": None,
+           "description": None, "organizer": None, "uid": None}
+    text = re.sub(r"\r?\n[ \t]", "", raw)
+    in_event = False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.upper() == "BEGIN:VEVENT":
+            in_event = True
+            continue
+        if line.upper() == "END:VEVENT":
+            break
+        if not in_event and "VEVENT" not in raw.upper():
+            in_event = True  # be lenient
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key_up = key.upper().split(";")[0]
+        if key_up == "SUMMARY":
+            out["title"] = val
+        elif key_up == "LOCATION":
+            out["location"] = val
+        elif key_up == "DTSTART":
+            out["start"] = val
+        elif key_up == "DTEND":
+            out["end"] = val
+        elif key_up == "DESCRIPTION":
+            out["description"] = val
+        elif key_up == "ORGANIZER":
+            out["organizer"] = val.replace("mailto:", "")
+        elif key_up == "UID":
+            out["uid"] = val
+    return out
+
+
+def parse_epc(raw: str) -> dict:
+    """SEPA EPC069-12 quick-response — 11 lines starting with BCD.
+
+    Fields: service tag, version, charset, identification, BIC, name,
+    IBAN, amount (EUR<n.nn>), purpose, ref, remittance, hint.
+    """
+    out = {"name": None, "iban": None, "bic": None, "amount": None,
+           "currency": None, "remittance": None, "reference": None}
+    lines = raw.replace("\r\n", "\n").split("\n")
+    if len(lines) < 6 or lines[0].upper() != "BCD":
+        return out
+    out["bic"] = lines[4] or None if len(lines) > 4 else None
+    out["name"] = lines[5] or None if len(lines) > 5 else None
+    out["iban"] = lines[6] or None if len(lines) > 6 else None
+    amt = lines[7] if len(lines) > 7 else ""
+    if amt and amt.upper().startswith("EUR"):
+        out["currency"] = "EUR"
+        try:
+            out["amount"] = float(amt[3:])
+        except ValueError:
+            pass
+    out["reference"] = lines[9] if len(lines) > 9 else None
+    out["remittance"] = lines[10] if len(lines) > 10 else None
+    return {k: v for k, v in out.items() if v}
+
+
+def parse_upi(raw: str) -> dict:
+    """upi://pay?pa=name@bank&pn=Display+Name&am=100.00&cu=INR&tn=note"""
+    out = {"upi_id": None, "name": None, "amount": None, "currency": None, "note": None}
+    s = raw.strip()
+    if not s.lower().startswith("upi://"):
+        return out
+    try:
+        parsed = urlparse(s)
+        qs = parse_qs(parsed.query)
+        out["upi_id"] = qs.get("pa", [None])[0]
+        out["name"] = qs.get("pn", [None])[0]
+        out["amount"] = qs.get("am", [None])[0]
+        out["currency"] = qs.get("cu", [None])[0]
+        out["note"] = qs.get("tn", [None])[0]
+    except Exception:
+        pass
+    return out
+
+
+def parse_crypto(qr_type: str, raw: str) -> dict:
+    """bitcoin:<addr>?amount=...&label=...
+    ethereum:<addr>@<chainId>?value=..."""
+    out = {"chain": qr_type, "address": None, "amount": None, "label": None}
+    s = raw.strip()
+    prefix = qr_type + ":"
+    if not s.lower().startswith(prefix):
+        return out
+    rest = s[len(prefix):]
+    addr_part, _, qs = rest.partition("?")
+    out["address"] = addr_part.split("@")[0].split("/")[0]
+    for kv in qs.split("&"):
+        k, _, v = kv.partition("=")
+        k = k.lower()
+        if k in ("amount", "value"):
+            try:
+                out["amount"] = float(v)
+            except ValueError:
+                out["amount"] = v
+        elif k == "label":
+            out["label"] = unquote(v)
+    return out
+
+
 def extract_qr_codes(path: str) -> list[dict]:
     """Decode QR codes from an image. Returns list of {raw, type, parsed}."""
     if cv2 is None:
@@ -471,6 +710,8 @@ def extract_qr_codes(path: str) -> list[dict]:
         return []
 
     decoded_raws: list[str] = []
+    # Per-raw barcode symbology hint (QRCODE, EAN13, CODE128, etc.)
+    symbology_by_raw: dict[str, str] = {}
 
     def _decode_with_pyzbar(image):
         out = []
@@ -484,6 +725,14 @@ def extract_qr_codes(path: str) -> list[dict]:
                     raw = str(d.data)
                 if raw:
                     out.append(raw)
+                    try:
+                        sym = getattr(d, "type", None) or ""
+                        if isinstance(sym, bytes):
+                            sym = sym.decode("ascii", "ignore")
+                        if sym:
+                            symbology_by_raw[raw] = sym
+                    except Exception:
+                        pass
         except Exception:
             pass
         return out
@@ -529,21 +778,50 @@ def extract_qr_codes(path: str) -> list[dict]:
 
     results = []
     seen = set()
+    _BARCODE_SYMS = {"EAN13", "EAN8", "UPCA", "UPCE", "CODE128", "CODE39",
+                     "I2OF5", "CODABAR", "DATABAR", "ITF"}
     for raw in decoded_raws:
         if raw in seen:
             continue
         seen.add(raw)
+        sym = symbology_by_raw.get(raw, "").upper()
+        # If pyzbar decoded a 1D barcode (not QR/PDF417/Aztec/DataMatrix), label it
+        if sym and sym in _BARCODE_SYMS:
+            results.append({
+                "raw": raw,
+                "type": "barcode",
+                "symbology": sym,
+                "parsed": {"code": raw, "symbology": sym},
+            })
+            continue
         qr_type = _classify_qr(raw)
+        parsed: dict = {}
         if qr_type == "vcard":
             parsed = parse_vcard(raw)
         elif qr_type == "mecard":
             parsed = parse_mecard(raw)
         elif qr_type in {"whatsapp", "whatsapp_group", "viber", "telegram", "line",
                          "signal", "kakao", "wechat", "skype", "zalo", "messenger",
-                         "instagram", "snapchat", "discord"}:
+                         "instagram", "snapchat", "discord", "threads"}:
             parsed = parse_messenger_qr(qr_type, raw)
-        else:
-            parsed = {}
+        elif qr_type == "tel":
+            parsed = parse_tel(raw)
+        elif qr_type == "email":
+            parsed = parse_email_qr(raw)
+        elif qr_type == "sms":
+            parsed = parse_sms(raw)
+        elif qr_type == "wifi":
+            parsed = parse_wifi(raw)
+        elif qr_type == "geo":
+            parsed = parse_geo(raw)
+        elif qr_type == "vevent":
+            parsed = parse_vevent(raw)
+        elif qr_type == "epc":
+            parsed = parse_epc(raw)
+        elif qr_type == "upi":
+            parsed = parse_upi(raw)
+        elif qr_type in ("bitcoin", "ethereum"):
+            parsed = parse_crypto(qr_type, raw)
         results.append({"raw": raw, "type": qr_type, "parsed": parsed})
     return results
 

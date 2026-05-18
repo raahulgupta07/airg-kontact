@@ -604,6 +604,26 @@ async def _process_batch(batch_id: str = None, owner_uuid: str = None, client_me
             except Exception as _e:
                 print(f"[url_resolver] error for {fname}: {_e}")
 
+            # ── VEVENT QR(s) → meeting rows ──
+            try:
+                vevents = r.get("meetings") or []
+                if vevents:
+                    with db.db() as _c:
+                        for ev in vevents:
+                            if not isinstance(ev, dict):
+                                continue
+                            db.create_meeting(
+                                _c,
+                                owner_uuid=doc_owner,
+                                company=r.get("company") or "",
+                                person=(r.get("contact") or {}).get("person") or "",
+                                meeting_date=ev.get("when_at"),
+                                location=ev.get("location"),
+                                notes=ev.get("title") or ev.get("description"),
+                            )
+            except Exception as _e:
+                print(f"[vevent] error for {fname}: {_e}")
+
             # ── Build metadata_extra (EXIF expansion + client + quality + geocode) ──
             src_path = r.get("source_path") or item.get("file_path") or ""
             exif_meta = r.get("metadata") or {}
