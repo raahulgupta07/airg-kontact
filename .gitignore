@@ -38,3 +38,4 @@ frontend/build/
 !data/extractions/*.json
 KONTACT_Deep_Dive*
 kontact-overview*
+backups/
