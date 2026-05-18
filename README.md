@@ -1,35 +1,314 @@
-# KONTACT — Catalog Vision RAG Agent
+# KONTACT
 
-Snap photos of product catalogs at trade shows, scan QR codes (vCard, WhatsApp, WeChat, URL), extract structured data with multi-agent AI vision, and chat with an intelligent agent that runs SQL queries, remembers facts, cites sources with images, and knows who you met.
+**Catalog vision RAG agent for trade shows.** Snap photos, scan QRs, extract structured data with multi-agent AI, and chat with an SQL-aware agent that remembers who you met.
 
-**Multi-tenant, hardened, production-shape.**
+Multi-tenant. Hardened. Production-shape. One-tap mobile.
 
-## What it does
-
-1. **Upload** — Phone camera, file picker, PDF, drag-drop. Browser geolocation + client EXIF fallback for stripped images.
-2. **Classify + Extract** — 8 specialized AI agents route + extract products, contacts, specs, prices, QR payloads.
-3. **Enrich** —
-   - EXIF: GPS, camera, lens, ISO, exposure, software, sub-second time
-   - Reverse geocode → country, city, address
-   - Perceptual hash + blur detection (blurry images skip LLM)
-   - QR decode: vCard, WhatsApp, WeChat, Viber, Telegram, Line, Signal, URL
-   - **URL QR resolver**: fetch landing page, parse JSON-LD + OG + microdata → person/company/phone/email
-4. **Normalize** — Products, contacts, companies, messengers in queryable tables with UUIDs.
-5. **Chat** — Agent with SQL tools, per-user history, streaming SSE, image citations, retry-on-429.
-6. **Browse** — 20-tab UI (Catalog / Insights / Workspace): tables, gallery, Leaflet map, timeline, dedup clusters, exports.
+---
 
 ## Quick start
 
 ```bash
+git clone https://github.com/raahulgupta07/airg-kontact.git
+cd airg-kontact
 cp .env.example .env
-# Edit .env: set OPENROUTER_API_KEY, SUPER_ADMIN_PASSWORD, SESSION_SECRET
+
+# Edit .env — set these 4 lines minimum
+#   OPENROUTER_API_KEY=sk-or-v1-...
+#   SESSION_SECRET=$(python3 -c 'import secrets;print(secrets.token_urlsafe(48))')
+#   SUPER_ADMIN_EMAIL=admin@yourdomain.com
+#   SUPER_ADMIN_PASSWORD=strong-password
+
 docker compose up -d --build kontact
-# http://localhost:8090
+# → http://localhost:8090
 ```
 
-Default super-admin login bootstraps from `.env`. Create more users from `/users`.
+## Test credentials (dev)
 
-## Production deploy
+```
+URL:       http://localhost:8090
+Phone:     http://<your-LAN-ip>:8090  (same WiFi)
+Email:     admin@kontact.local
+Password:  KontactAdmin2026!
+```
+
+---
+
+## What it does
+
+1. **Capture** — phone camera / library picker / file picker / PDF / drag-drop. Browser geolocation + EXIF sidecar.
+2. **Auto-classify + extract** — 8 specialized vision agents (product page, contact card, QR card, business card, price list, brochure, certification, other).
+3. **Enrich**
+   - **EXIF**: GPS, camera, lens, ISO, exposure, software, sub-second
+   - **Geocode**: country + city + address via Nominatim
+   - **Image quality**: perceptual hash + Laplacian blur + near-dup clustering
+   - **QR/barcode decode** (40+ formats — see matrix below)
+   - **URL profile resolution** (JSON-LD + OG + microdata; SSRF-guarded)
+4. **Tag** — heuristic auto-tags: industry, region, content type, signal flags
+5. **Normalize** — products/contacts in queryable tables with UUIDs, currency + price_amount parsed out
+6. **Chat** — SQL tool loop (Gemini 3.1 Flash Lite via OpenRouter), per-user history, streaming, image citations
+7. **Browse** — 20-tab grouped UI, Leaflet map, lightbox, vCard export, contact merge, quick filters
+
+---
+
+## QR + barcode support (40+ formats)
+
+| Category | Formats |
+|----------|---------|
+| **Contact cards** | vCard 3.0/4.0, MeCard (Japan/KR) |
+| **Messengers** | WhatsApp (E.164 / invite-code / business message), WeChat URL, Viber, Telegram (tg://, t.me), Line, Signal, Kakao (incl `pf.kakao.com`), Zalo (Vietnam), Skype, Messenger, Instagram, Snapchat, Discord, Threads |
+| **Communication** | `tel:`, `mailto:`, MATMSG, `smsto:`, `sms:` |
+| **Connectivity** | WiFi (`WIFI:T:WPA;S:...;P:...;`) |
+| **Location** | GeoURL (`geo:lat,lng?q=...`) — overrides GPS if EXIF missing |
+| **Calendar** | iCalendar VEVENT → auto-creates meeting row |
+| **Payments** | EPC SEPA (EU bank), UPI (India), PIX (Brazil), Bitcoin, Ethereum |
+| **Profile URLs** | any HTTPS URL — fetched, parsed via JSON-LD + OG + microdata |
+| **1D barcodes** | EAN13, EAN8, UPCA, UPCE, CODE128, CODE39, ITF (via pyzbar symbology) |
+| **Plain text** | stored as-is |
+
+---
+
+## Auth
+
+**Email + password only.** Phone/PIN auth removed for simplicity.
+
+- bcrypt 4.0.1 (passlib pinned)
+- HttpOnly cookie sessions, 14-day, itsdangerous-signed
+- `COOKIE_SECURE` env-driven for HTTPS prod
+- 5 fails / 15 min → 30-min lockout
+- Per-user rate limits: 10/min login, 60/min upload, 120/min chat (slowapi)
+- Multi-tenant: `visibility_clause()` enforces `owner_uuid` filter on every visible query; `super_admin` sees all
+
+Super admin bootstraps from `.env`:
+```bash
+SUPER_ADMIN_EMAIL=admin@yourdomain.com
+SUPER_ADMIN_PASSWORD=<strong>
+SUPER_ADMIN_NAME=Your Name
+```
+Additional users created via `/users` admin UI.
+
+---
+
+## Workflow features
+
+### Trade-show grouping
+Tag every upload with a show label (e.g. "CES 2026"). Persists in localStorage on upload page. Filter `/data` by `?trade_show=<name>`. Aggregation: `/api/aggregations/trade-shows`.
+
+### AI auto-tagging
+Each ingested document gets 3–6 heuristic tags applied automatically:
+- Content type: `product`, `contact-card`, `pricing`, `blurry`
+- Industry: `pumps`, `electronics`, `machinery`, `pharma`, `solar`, `auto`, `textile`, `food`, `chemicals`, `packaging`, `logistics`
+- Region: `region-asia`, `region-eu`, `region-na`
+- Signal flags: `has-qr`, `has-messenger`, `has-phone`, `has-email`, `has-pricing`
+
+### Currency normalization
+Free-form prices (`$4,850 USD`, `€ 1.234,50`, `RMB 12,000`, `₹999/-`) parsed into:
+- `products.currency` — ISO 4217 code (USD, EUR, CNY, INR, JPY, GBP, …)
+- `products.price_amount` — numeric value
+
+### Contact deduplication + merge
+- `GET /api/contacts/duplicates` → groups by `phone_e164` or `email` match
+- `POST /api/contacts/merge` → moves notes/meetings, deletes drop
+- `GET /api/contacts/{uuid}/vcard` → RFC 6350 `.vcf` (opens in phone Contacts)
+- `GET /api/export/vcards.zip` → bulk vCards
+
+### Quick filters
+```
+/api/data?trade_show=CES%202026&country=China&has_qr=1&has_gps=1
+```
+
+### Image lightbox
+Click any thumbnail in `/queue` → full image + side panel (filename, type chip, company, trade-show chip, contact, products with prices, GPS, camera, date). Esc/backdrop closes. Mobile responsive.
+
+### PWA install
+Bottom banner with "Install" button on Chrome/Edge. Dismissal persisted in localStorage.
+
+### One-tap mobile upload
+Pick file → auto-submits → 900ms confirmation card → auto-redirect to `/queue`.
+
+---
+
+## Architecture
+
+```
+Phone Camera / Files / PDF / Sync Watcher
+         ↓
+Upload (size + MIME + filename + PIL-bomb guards, trade_show tag)
+         ↓
+Queue (SQLite, owner_uuid + trade_show per row)
+         ↓
+Loader: EXIF + 40+ QR/barcode parsers + phash + blur
+         ↓
+Extractor:
+    is_blurry? → skip LLM, mark blurry, no hallucination
+    else → Classifier → Specialized agent (Gemini via OpenRouter)
+         ↓
+    Merge QR + URL-resolver enrichment for URL-type QRs
+         ↓
+Insert: documents + products (+currency/price_amount) + contacts +
+        messengers + meetings (from VEVENT) + audit
+         ↓
+Auto-tag (industry, region, signal flags)
+         ↓
+Storage: local disk OR S3 (mirror via storage.save_file)
+         ↓
+Index: ChromaDB + FTS5
+         ↓
+Agent: SQL tool loop + per-user memory + streaming + retry-on-429
+```
+
+---
+
+## Database (12 tables, FK enforced, WAL)
+
+```
+users              uuid, email, phone_e164, password_hash, role, is_active
+documents          50+ cols (EXIF, geo, quality, audit, trade_show)
+products           normalized + currency + price_amount
+contacts           normalized + messenger columns
+queue              with owner_uuid + trade_show
+documents_fts      FTS5 virtual
+chat_history       per-session + user_uuid (strict scope)
+audit_events       upload/login/edit/delete/share/merge
+login_attempts     throttle log
+tags + document_tags + notes + meetings + events    workspace CRUD
+```
+
+---
+
+## API (50+ endpoints)
+
+```
+# Auth
+POST   /api/auth/login              email + password, 10/min/IP
+POST   /api/auth/logout
+GET    /api/auth/me
+
+# Users (admin-only)
+GET POST PATCH DELETE /api/users{/uuid}
+
+# Upload + queue
+POST   /api/upload                  60/min/user, accepts trade_show form field
+GET    /api/queue/batches           per-user (admin: all)
+GET    /api/queue                   status counts
+POST   /api/queue/retry/{id}
+DELETE /api/batch/{id}              cascades DB + Chroma + storage
+
+# Chat
+POST   /api/chat                    120/min/user, SQL tool loop
+POST   /api/chat/stream             SSE
+GET    /api/chat/sessions           per-user
+GET    /api/chat/history/{sid}
+DELETE /api/chat/sessions/{sid}
+
+# Data + filters
+GET    /api/data?trade_show=&country=&has_qr=&has_gps=
+GET    /api/documents/{id}
+GET    /api/products                with currency + price_amount
+GET    /api/contacts
+GET    /api/contacts/duplicates     dedup suggestions
+POST   /api/contacts/merge          keep_uuid + drop_uuid
+GET    /api/contacts/{uuid}/vcard   .vcf download
+PATCH  /api/contacts/{uuid}
+DELETE /api/contacts/{uuid}
+GET    /api/export/vcards.zip       bulk
+GET    /api/search?q=               FTS5
+GET    /api/search/semantic?q=      ChromaDB
+
+# 12 aggregations
+GET    /api/aggregations/{locations,countries,timeline,cameras,messengers,
+                          qr-codes,quality,duplicates,sync-sources,pricing,
+                          map-points,trade-shows}
+
+# Workspace CRUD
+{GET POST PATCH DELETE} /api/{tags,notes,meetings,events}
+
+# Image (auth + ownership + realpath)
+GET    /api/image/{folder}/{filename}    local FileResponse OR S3 presigned redirect
+
+# Export
+GET    /api/export/{xlsx,csv,json}
+
+# Other
+POST   /api/feedback
+GET    /api/memories
+GET    /api/config                  auth-gated
+GET    /health                      public
+```
+
+---
+
+## Security
+
+| Layer | Control |
+|-------|---------|
+| Secrets | `SESSION_SECRET` ≥32 chars enforced at startup; placeholders fail. `.env` gitignored. |
+| CORS | `CORS_ORIGINS` env, no wildcard w/ credentials |
+| SQL injection | UUID strict regex + `uuid.UUID()` parse before TEMP VIEW interpolation |
+| Path traversal | `os.path.realpath` + `_safe_under(UPLOADS_DIR)` + null-byte block |
+| Image ownership | `owner_uuid` join on every serve (non-admin) |
+| Upload | MIME allowlist + 100MB cap + safe filename + PIL 100MP bomb guard + PDF 200-page cap |
+| SSRF | `url_resolver.py` blocks private/loopback/link-local IPs + `.local` hosts |
+| Rate limit | slowapi per-user keying (so shared NAT doesn't share quotas) |
+| DB | `PRAGMA foreign_keys=ON` on every connection, WAL, 30s busy_timeout |
+| LLM | OpenRouter 3× exp-backoff retry on 429/5xx |
+| Storage | ChromaDB daily prune + cascade delete on batch removal |
+| Privacy | `visibility_clause()` filters `owner_uuid` everywhere |
+| Audit | `audit_events` table logs upload/login/edit/delete/share/merge |
+
+---
+
+## Storage backend (local or S3)
+
+```bash
+STORAGE_BACKEND=local                # default — data/uploads/ on disk
+# OR
+STORAGE_BACKEND=s3
+S3_BUCKET=my-kontact-uploads
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+S3_ENDPOINT_URL=                     # blank=AWS; set for R2/B2/MinIO
+S3_REGION=us-east-1
+S3_PREFIX=prod/
+S3_PUBLIC_BASE_URL=                  # if bucket public
+```
+
+Image serve auto-switches: local backend streams via `FileResponse`, S3 backend redirects to presigned URL (10-min expiry).
+
+Migration (one-time, idempotent):
+```bash
+docker compose exec kontact python3 migrate_to_s3.py
+```
+
+Tested with AWS S3, Cloudflare R2, Backblaze B2, MinIO, Wasabi.
+
+---
+
+## Backup + restore
+
+```bash
+./backup.sh                          # → backups/kontact-backup-YYYYMMDD-HHMMSS.tar.gz
+./restore.sh <archive>               # idempotent restore on any server
+```
+
+Captures: SQLite DB (WAL-checkpointed) + ChromaDB + uploads + extractions + `.env`. Single archive, ~2MB on a fresh install.
+
+Migrate to new server:
+```bash
+# OLD machine
+./backup.sh
+scp backups/kontact-backup-*.tar.gz user@new-server:/tmp/
+
+# NEW machine
+git clone https://github.com/raahulgupta07/airg-kontact.git
+cd airg-kontact
+./restore.sh /tmp/kontact-backup-*.tar.gz
+docker compose up -d --build kontact
+```
+
+---
+
+## Production deploy (HTTPS via Caddy)
 
 ```bash
 # In .env
@@ -37,207 +316,76 @@ COOKIE_SECURE=true
 CORS_ORIGINS=https://kontact.yourdomain.com
 DOMAIN=kontact.yourdomain.com
 SUPER_ADMIN_PASSWORD=<rotate>
-SESSION_SECRET=$(python3 -c 'import secrets;print(secrets.token_urlsafe(48))')
+SESSION_SECRET=<rotate>
 
-# Caddy + Let's Encrypt
+# DNS: A/AAAA record → server IP, port 80+443 open
 docker compose --profile https up -d
 ```
 
-## Auth
+Caddy auto-issues Let's Encrypt cert.
 
-**Email + password only.** Phone/PIN auth removed for simplicity.
-
-| Field | Note |
-|-------|------|
-| Email | normalized lowercase; `type=email` browser validation |
-| Password | bcrypt 4.0.1 (passlib pinned) |
-
-Session = HttpOnly cookie, 14-day, signed (itsdangerous), HTTPS-secure when `COOKIE_SECURE=true`.
-
-5 fails in 15 min → 30-min lockout. Rate limits: 10/min login, 30/min upload, 60/min chat.
-
-Bootstrap super admin from `.env` on first start:
-```bash
-SUPER_ADMIN_EMAIL=admin@yourdomain.com
-SUPER_ADMIN_PASSWORD=<strong>
-SUPER_ADMIN_NAME=Your Name
-```
-Additional users created via `/users` admin UI (also email + password only).
-
-## Architecture
-
-```
-Phone Camera / File Picker / PDF / Sync Watcher
-        ↓
-Upload (MIME + size + PIL bomb guards + safe filename)
-        ↓
-Queue (SQLite, owner_uuid per row)
-        ↓
-Loader: EXIF + QR + phash + blur
-        ↓
-Extractor:
-    is_blurry? → skip LLM, mark blurry
-    else → Classifier (Gemini 3.1 Flash Lite) → Specialized agent
-                ↓
-        Merge QR + url_resolver enrichment for URL-type QRs
-        ↓
-Insert: documents + products + contacts + messengers + audit
-        ↓
-Index: ChromaDB (vector) + FTS5 (lexical) + audit_events
-        ↓
-Agent: SQL tool loop + memory + streaming SSE
-```
-
-## Database (12 tables)
-
-| Table | Purpose |
-|-------|---------|
-| `users` | accounts, roles, last_login |
-| `documents` | catalog pages, 50+ columns (EXIF, geo, quality, audit) |
-| `products` | normalized one-per-row |
-| `contacts` | normalized one-per-row, messenger columns |
-| `documents_fts` | FTS5 virtual table |
-| `queue` | upload queue, owner_uuid |
-| `chat_history` | per-session, scoped by user_uuid |
-| `login_attempts` | throttle log |
-| `audit_events` | upload/login/edit/delete/share/merge |
-| `tags`, `document_tags`, `notes`, `meetings`, `events` | workspace CRUD |
-
-`PRAGMA foreign_keys=ON`. WAL mode. 30s busy_timeout.
-
-## Endpoints (50+)
-
-```
-/api/auth/{login,logout,me}                                 email + password
-/api/users {GET POST PATCH DELETE}
-/api/upload {POST}                                          form field: trade_show
-/api/queue {GET}  /api/queue/batches  /api/queue/retry/{id} /api/batch/{id} {DELETE}
-/api/chat {POST}  /api/chat/stream {SSE}  /api/chat/sessions  /api/chat/history/{sid}
-/api/data?trade_show=&country=&has_qr=&has_gps=             quick filters
-/api/products  /api/contacts  /api/dashboard
-/api/search  /api/search/semantic
-/api/contacts/duplicates                                    dedup suggestions
-/api/contacts/merge {POST}                                  keep_uuid + drop_uuid
-/api/contacts/{uuid}/vcard                                  .vcf download
-/api/export/vcards.zip                                      bulk vCards
-/api/aggregations/{locations,countries,timeline,cameras,messengers,
-                   qr-codes,quality,duplicates,sync-sources,pricing,
-                   map-points,trade-shows}
-/api/tags /api/notes /api/meetings /api/events {CRUD}
-/api/image/{folder}/{file}                                  realpath-checked, owner-scoped
-/api/export/{xlsx,csv,json}
-/api/feedback /api/memories /api/config (auth)
-/health (public)
-```
-
-## Security
-
-| Layer | Control |
-|-------|---------|
-| Secrets | `SESSION_SECRET` ≥32 chars, fails startup if placeholder. Live API key/admin password never in repo (`.env` gitignored). |
-| CORS | env-driven origins, no wildcard with credentials |
-| Auth | bcrypt 4.0.1 (passlib pinned), HttpOnly cookies, JWT-style timed token |
-| Privacy | `visibility_clause()` filters `owner_uuid` on every query; chat history `user_uuid` strict; TEMP VIEW rewriter for chat SQL tool |
-| Input | UUID strict-parse before SQL, MIME allowlist, 100MB size cap, PIL 100MP pixel cap, PDF 200-page cap |
-| Network | SSRF guard in url_resolver (blocks private IPs, `.local`, loopback) |
-| Path | image serve uses `realpath` + `_safe_under(UPLOADS_DIR)` |
-| Rate | slowapi per-route |
-| DB | FK ON, busy_timeout, WAL, `INSERT OR REPLACE` removed for FK safety |
-| LLM | OpenRouter 3× retry on 429/5xx |
-| Storage | ChromaDB daily prune + cascade delete on batch removal |
-
-## EXIF + browser geo
-
-`pipeline/loader.py:extract_exif` reads via PIL `getexif().get_ifd()`:
-- GPS lat/lng/altitude/heading/speed (with unit conversion)
-- DateTimeOriginal + sub-second
-- Camera make/model, lens model, focal length, f-number, ISO, exposure time
-- Orientation, dimensions, file size
-
-Client-side fallback in `upload/+page.svelte`:
-- `exifr@7.1.3` reads EXIF before browser strips it
-- `navigator.geolocation` (8s timeout)
-- `DeviceOrientationEvent` (iOS heading)
-- Battery API + device signals JSON
-
-Server merges in priority: EXIF > client EXIF sidecar > browser geo.
-
-## QR + barcode support matrix
-
-| Category | Formats |
-|----------|---------|
-| **Contact cards** | vCard 3.0/4.0, MeCard (Japan/KR) |
-| **Messengers** | WhatsApp (`wa.me/<E164>`, `wa.me/qr/<code>`, `wa.me/message/<code>`), WeChat URL, Viber, Telegram, Line, Signal, Kakao (incl `pf.kakao.com`), Zalo, Skype, Messenger, Instagram, Snapchat, Discord, Threads |
-| **Communication** | `tel:`, `mailto:`, MATMSG, `smsto:`, `sms:` |
-| **Connectivity** | WiFi (`WIFI:T:WPA;S:...;P:...;`) |
-| **Location** | GeoURL (`geo:lat,lng?q=...`) — overrides GPS if EXIF missing |
-| **Calendar** | iCalendar VEVENT — auto-creates meeting row |
-| **Payments** | EPC SEPA (EU bank), UPI (India), PIX (Brazil), Bitcoin, Ethereum |
-| **Profile URLs** | any HTTPS URL — fetched, parsed via JSON-LD + OG + microdata |
-| **1D barcodes** | EAN13, EAN8, UPCA, UPCE, CODE128, CODE39, ITF (via pyzbar symbology) |
-| **Plain text** | stored as-is |
-
-## URL profile resolver
-
-`pipeline/url_resolver.py` — when a QR encodes a plain URL:
-- SSRF guard (block private/loopback/link-local)
-- httpx GET, 8s timeout, 2MB cap, 4 redirects
-- Parse: JSON-LD Person/Organization/LocalBusiness → name/phone/email/address/jobTitle/sameAs
-- Fallback: OG meta (title, site_name), `mailto:`/`tel:` links, regex on text
-- Phone → E.164 via phonenumbers
-
-Tested: GitHub profile → person + company + social URLs extracted.
-
-## Frontend
-
-SvelteKit 5 + Tailwind v4 + Svelte 5 runes. Routes:
-
-| Route | Purpose |
-|-------|---------|
-| `/login` | email/phone + password/PIN, show-pw, remember me |
-| `/upload` | hero camera + 3 inputs (camera/library/files) + EXIF/geo capture |
-| `/queue` | batch list, inline expand, retry, delete |
-| `/chat` | streaming SSE + SQL tool steps + citations + feedback + voice |
-| `/data` | grouped 3-section nav: Catalog (7), Insights (10), Workspace (3) |
-| `/users` | admin: CRUD users |
-
-20 sub-tabs include ProductsTable, ContactsTable, CompaniesTable, CategoriesTable, SpecsTable, Gallery, LocationsMap (Leaflet), Timeline, Countries, Messengers, QrCodes, Quality, Duplicates, SyncSources, Cameras, Pricing, Tags, Notes, Meetings.
+---
 
 ## Tech stack
 
 | Layer | Choice |
 |-------|--------|
-| Backend | FastAPI + Python 3.12 (3,500 LOC) |
-| Frontend | SvelteKit 5 + Tailwind v4 (5,500 LOC) |
+| Backend | FastAPI 0.115.6 + Python 3.12 |
+| Frontend | SvelteKit 5 + Svelte 5 runes + Tailwind v4 |
 | LLM | Gemini 3.1 Flash Lite via OpenRouter |
 | Embeddings | OpenAI text-embedding-3-small via OpenRouter |
-| DB | SQLite WAL + FTS5 + 12 tables + UUIDs |
+| DB | SQLite WAL + FTS5 |
 | Vectors | ChromaDB (daily prune) |
-| Auth | bcrypt + passlib + itsdangerous + phonenumbers |
-| QR | pyzbar + cv2 (with rotation fallback) |
-| Image | Pillow + pillow-heif + imagehash + cv2 Laplacian |
-| Rate limit | slowapi |
-| Deploy | Docker multi-stage + Caddy (auto Let's Encrypt) |
-| PWA | manifest + service worker (network-first) |
+| Storage | Local OR S3-compatible (boto3) |
+| Auth | bcrypt 4.0.1 + passlib 1.7.4 + itsdangerous + phonenumbers |
+| QR | pyzbar + opencv-python (rotation fallback) |
+| Image | Pillow + pillow-heif + imagehash + PyMuPDF |
+| HTTP | httpx |
+| Parse | beautifulsoup4 |
+| Rate limit | slowapi (per-user keying) |
+| Deploy | Docker multi-stage + Caddy 2-alpine (auto Let's Encrypt) |
+| PWA | manifest + service worker + install banner |
 
-## Configuration (.env)
+---
+
+## Configuration reference
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `OPENROUTER_API_KEY` | — | required |
-| `SESSION_SECRET` | — | ≥32 chars, fails startup if missing/placeholder |
+| **Required** | | |
+| `OPENROUTER_API_KEY` | — | LLM + embeddings |
+| `SESSION_SECRET` | — | ≥32 chars; fails startup if missing/placeholder |
+| `SUPER_ADMIN_EMAIL` | — | Bootstrap admin email (used for login) |
+| `SUPER_ADMIN_PASSWORD` | — | Bootstrap admin password |
+| **Optional** | | |
+| `SUPER_ADMIN_NAME` | "Super Admin" | display name |
 | `SESSION_DAYS` | 14 | cookie lifetime |
 | `COOKIE_SECURE` | auto | `true` in prod (HTTPS) |
-| `CORS_ORIGINS` | localhost | comma-separated, no wildcard w/ credentials |
-| `SUPER_ADMIN_{EMAIL,PASSWORD,NAME}` | — | bootstrap |
+| `CORS_ORIGINS` | localhost | comma-sep; `*` disables credentials |
 | `MAX_UPLOAD_BYTES` | 104857600 | 100MB per file |
 | `MAX_IMAGE_PIXELS` | 100000000 | PIL bomb guard |
 | `RATE_LIMIT_ENABLED` | true | slowapi toggle |
-| `DOMAIN` | — | Caddy auto-TLS |
+| `STORAGE_BACKEND` | local | `s3` for cloud |
+| `S3_BUCKET / S3_*` | — | S3-compatible config |
+| `DOMAIN` | kontact.example.com | Caddy TLS |
 | `VISION_MODEL` | google/gemini-3.1-flash-lite-preview | |
 | `EMBEDDING_MODEL` | openai/text-embedding-3-small | |
 | `MAX_WORKERS` | 8 | extraction concurrency |
-| `PORT` | 8000 | |
+| `PORT` | 8090 | LAN dev port |
+| `WECHAT_WATCH_DIR` | — | auto-start WeChat sync watcher |
+
+---
+
+## Capacity
+
+| Team size | Action |
+|-----------|--------|
+| 1–10 | works as-is, single uvicorn worker |
+| 10–50 | bump Dockerfile: `--workers 4` |
+| 50–500 | migrate SQLite → Postgres |
+| 500+ | multi-container + Redis + Postgres + S3 + pgvector |
+
+---
 
 ## Commands
 
@@ -246,84 +394,17 @@ SvelteKit 5 + Tailwind v4 + Svelte 5 runes. Routes:
 docker compose up -d --build kontact
 docker compose logs -f kontact
 
-# Test (synthetic fixtures + curl smoke)
-python3 /tmp/kontact_test/make_fixtures.py  # see CLAUDE.md
-curl -c jar -X POST localhost:8090/api/auth/login -H 'Content-Type: application/json' \
-  -d '{"identifier":"admin@kontact.local","secret":"<pwd>"}'
+# Backup
+./backup.sh
+
+# Migrate uploads to S3 (after STORAGE_BACKEND=s3 + S3_* set)
+docker compose exec kontact python3 migrate_to_s3.py
 
 # Frontend hot reload (proxy /api → :8090)
 cd frontend && npm run dev
 ```
 
-## Workflow features
-
-### Trade-show grouping
-Tag every upload with a show label (e.g. "CES 2026"). Persists in localStorage on upload page. Filter `/data` by `?trade_show=<name>`. Aggregation endpoint `/api/aggregations/trade-shows` returns counts.
-
-### AI auto-tagging
-Each ingested document gets 3-6 heuristic tags applied automatically:
-- Content type: `product`, `contact-card`, `pricing`, `blurry`
-- Industry: `pumps`, `electronics`, `machinery`, `pharma`, `solar`, …
-- Region: `region-asia`, `region-eu`, `region-na` (from geocoded country)
-- Signal flags: `has-qr`, `has-messenger`, `has-phone`, `has-email`, `has-pricing`
-
-### Currency normalization
-Free-form prices (`$4,850 USD`, `€ 1.234,50`, `RMB 12,000`, `₹999/-`) parsed into:
-- `products.currency` — ISO 4217 code (USD, EUR, CNY, INR, …)
-- `products.price_amount` — numeric value
-
-### Contact deduplication + merge
-- `/api/contacts/duplicates` groups by `phone_e164` or `email` match
-- `/api/contacts/merge` moves children (notes, meetings) to the kept row and deletes the drop
-- vCard download per contact: `GET /api/contacts/{uuid}/vcard` → `.vcf` → opens in phone Contacts
-
-### Quick filters
-`/api/data?trade_show=...&country=...&has_qr=1&has_gps=1` — server-side post-filter visible to user.
-
-### Image lightbox
-Click any thumbnail in `/queue` → full-image modal with side panel (filename, type chip, company, trade-show chip, contact, products with prices, GPS, camera, date). Esc/backdrop closes.
-
-### PWA install
-Bottom banner with "Install" button on Chrome/Edge. Stores dismissal in localStorage so it doesn't nag.
-
-## Storage backend (local or S3)
-
-`STORAGE_BACKEND=local` (default) — uploads live in `data/uploads/` on disk.
-
-`STORAGE_BACKEND=s3` — mirror every upload to S3-compatible storage. Works with:
-- AWS S3
-- Cloudflare R2 (`S3_ENDPOINT_URL=https://<account>.r2.cloudflarestorage.com`)
-- Backblaze B2 (`S3_ENDPOINT_URL=https://s3.<region>.backblazeb2.com`)
-- MinIO (`S3_ENDPOINT_URL=http://minio:9000`)
-- Wasabi
-
-Image serve returns a presigned URL (10-min expiry) instead of streaming the file → CDN-friendly, multi-container safe.
-
-```bash
-# .env additions
-STORAGE_BACKEND=s3
-S3_BUCKET=my-kontact-uploads
-AWS_ACCESS_KEY_ID=AKIA...
-AWS_SECRET_ACCESS_KEY=...
-S3_REGION=us-east-1
-S3_ENDPOINT_URL=                 # blank = AWS; set for R2/B2/MinIO
-S3_PREFIX=prod/                  # optional
-S3_PUBLIC_BASE_URL=              # set if bucket is public (skips presign)
-
-# Migrate existing local uploads to S3 (one-time, idempotent)
-docker compose exec kontact python3 migrate_to_s3.py
-```
-
-Cascading: deleting a batch removes both DB rows AND the S3 prefix.
-
-## Backup + restore
-
-```bash
-./backup.sh                       # → backups/kontact-backup-YYYYMMDD-HHMMSS.tar.gz
-./restore.sh <archive>            # restore on any server
-```
-
-Captures: SQLite DB (WAL-checkpointed) + ChromaDB + uploads + extractions + `.env`. See [`CLAUDE.md`](CLAUDE.md) for full details.
+---
 
 ## License
 

@@ -1,36 +1,42 @@
 # CLAUDE.md
 
+Internal reference for working on KONTACT. Read this before making changes.
+
 ## Project Overview
 
-KONTACT is a **multi-tenant catalog vision RAG agent** — snap photos of product catalogs and contact QRs at trade shows, extract structured data with multi-agent AI vision, and chat with an intelligent agent that runs SQL queries, remembers facts, cites sources with images, and knows who you met.
+**Multi-tenant catalog vision RAG agent** — trade-show team uploads catalog photos + business-card QRs, extractors structure the data, agent answers SQL-aware questions about who-met-where.
 
-**Hardened, production-shape**: 35 security/bug fixes/features landed (5 CRITICAL, 8 HIGH, 5 MEDIUM, 4 functional bugs, 13 features) — see "Hardening landmarks" below.
+**Status**: Production-shape. 35 fixes/features landed across this session — see "Hardening landmarks" below.
 
 **Architecture**:
 ```
-Phone Camera / Files → Upload (guards) → Queue → Loader (EXIF + QR + phash + blur)
-  → Extractor (skip-blurry / Classifier → Specialized agent)
-  → URL resolver (for URL QRs)
-  → Insert documents + products + contacts + messengers + audit
+Phone Camera / Files → Upload (guards + trade_show tag)
+  → Queue (per-user owner_uuid)
+  → Loader (EXIF + 40+ QR/barcode parsers + phash + blur)
+  → Extractor (skip-blurry → classifier → specialized agent → merge QR)
+  → URL resolver (JSON-LD/OG/microdata for URL-type QRs)
+  → Insert documents + products (+currency/price_amount) + contacts + meetings (from VEVENT) + audit
+  → Auto-tag (industry, region, signals)
+  → Storage mirror (local or S3)
   → Index ChromaDB + FTS5
-  → Chat Agent (SQL tool loop + memory + retry)
+  → Chat (SQL tool loop + per-user memory + streaming + 3× retry)
 ```
 
 ## Structure
 
 ```
 City-KONTACT/
-├── main.py                     # FastAPI entry (50+ endpoints, SSE, slowapi, CORS env-driven)
-├── auth.py                     # bcrypt + passlib + itsdangerous + phonenumbers
-├── storage.py                  # Pluggable LocalStorage / S3Storage (boto3) backend
-├── config.py                   # Env-based config
+├── main.py                     # FastAPI (50+ endpoints, SSE, slowapi per-user, CORS env)
+├── auth.py                     # bcrypt + passlib + itsdangerous + phonenumbers (email-only)
+├── storage.py                  # Pluggable LocalStorage / S3Storage (boto3)
+├── config.py
 ├── chat.py                     # Agent: RAG + SQL tool loop + memory + OpenRouter retry
-├── tools.py                    # SQL tool (UUID-validated TEMP VIEW per user), introspect, summary
-├── memory.py                   # Feedback + memories (JSON files)
-├── database.py                 # SQLite WAL + FTS5 + 12 tables + audit + FK enforced
+├── tools.py                    # SQL tool (UUID-validated TEMP VIEW per user)
+├── memory.py
+├── database.py                 # SQLite WAL + FTS5 + 12 tables + FK enforced
 ├── vectorstore.py              # ChromaDB + prune_orphans + delete_by_folder
 ├── pipeline/
-│   ├── loader.py               # PIL + EXIF + 13 QR/barcode parsers + blur + phash
+│   ├── loader.py               # PIL + EXIF + 40+ QR/barcode parsers + blur + phash
 │   ├── extractor.py            # Async batch (classifier → agent), skip-blurry, merge loader meta
 │   ├── agents.py               # 8 specialized prompts
 │   ├── geocode.py              # Nominatim reverse geocode (cached, rate-limited)
@@ -38,265 +44,198 @@ City-KONTACT/
 │   ├── url_resolver.py         # SSRF-safe URL→JSON-LD/OG/regex contact
 │   ├── tagger.py               # Heuristic auto-tagger (industry/region/signal)
 │   └── pricing.py              # Currency + numeric amount parser
-├── backup.sh                   # Full system snapshot → backups/*.tar.gz
-├── restore.sh                  # Restore on any server
-├── migrate_to_s3.py            # One-shot upload migration to S3
 ├── sync/                       # WeChat folder watcher
-├── data/
-│   ├── kontact.db              # SQLite (WAL + FTS5 + 12 tables)
-│   ├── chroma/                 # ChromaDB persistent
-│   ├── extractions/            # JSON output files per batch
-│   ├── uploads/                # Uploaded batches
-│   ├── feedback.json
-│   └── memories.json
-├── frontend/src/
-│   ├── app.css                 # Claude.ai theme (copper/charcoal, Tiempos serif)
-│   ├── lib/
-│   │   ├── api.ts              # Typed API client (cookie-credentials)
-│   │   ├── auth.svelte.ts      # AuthState class w/ $state user/isAdmin
-│   │   ├── markdown.ts
-│   │   ├── utils.ts            # shortDate/relativeDate helpers
-│   │   └── components/         # 13 components: tables, gallery, LocationsMap, Timeline, Tags, Notes, etc.
-│   └── routes/
-│       ├── +layout.svelte      # Desktop sidebar + mobile bottom nav
-│       ├── login/              # email + password only + show-pw + remember
-│       ├── upload/             # 3 inputs (camera/library/files) + exifr + geo capture
-│       ├── queue/              # Batch list, retry, delete, toast
-│       ├── chat/               # Streaming SSE + tool steps + citations + feedback + voice
-│       ├── data/               # 20-tab grouped UI: Catalog (7) / Insights (10) / Workspace (3)
-│       └── users/              # Admin CRUD
-├── Dockerfile                  # Multi-stage (Node + Python + curl healthcheck)
-├── docker-compose.yml          # kontact + caddy (profiles:["https"], opt-in)
-├── Caddyfile                   # reverse_proxy w/ auto Let's Encrypt
-├── deploy.sh
-├── requirements.txt            # Pinned (bcrypt 4.0.1 — DO NOT bump to 5.x w/o passlib check)
+├── data/                       # Runtime: kontact.db, chroma/, uploads/, extractions/, *.json
+├── frontend/src/               # SvelteKit 5 + Svelte 5 runes
+├── backup.sh                   # Full system snapshot → backups/*.tar.gz
+├── restore.sh
+├── migrate_to_s3.py            # One-shot upload migration
+├── Dockerfile / docker-compose.yml / Caddyfile
+├── requirements.txt            # bcrypt 4.0.1 PINNED, slowapi, boto3, etc.
 └── .env.example
 ```
 
 ## Database (12 tables, FK ON, WAL)
 
 ```sql
--- Identity + access
-users               -- uuid, email, phone_e164 (contact-only), password_hash, pin_hash (unused), role, is_active
-login_attempts      -- throttle log (5 fails/15min → 30min lockout)
-audit_events        -- upload/login/edit/delete/share/merge
-
--- Core catalog
-documents           -- 50+ cols: products/contact JSON, EXIF, geo, quality, audit
-products            -- normalized one-per-row (FK document_id)
-contacts            -- normalized + messenger cols (FK document_id)
-documents_fts       -- FTS5 virtual
-
--- Pipeline
-queue               -- upload queue w/ owner_uuid + status
-
--- Chat
-chat_history        -- session_id + user_uuid (strict scope)
-
--- Workspace (aux CRUD)
-tags, document_tags, notes, meetings, events
+users               uuid, email, phone_e164 (contact-only), password_hash,
+                    pin_hash (unused), role, is_active, last_login
+documents           50+ cols: products/contact JSON, EXIF, geo, quality,
+                    audit, trade_show
+products            normalized + currency + price_amount
+contacts            normalized + messenger cols (whatsapp, wechat_qr_url,
+                    viber, telegram, line_id, signal_phone)
+documents_fts       FTS5 virtual
+queue               owner_uuid + trade_show + status
+chat_history        session_id + user_uuid (strict scope)
+login_attempts      throttle log
+audit_events        upload/login/edit/delete/share/merge
+tags, document_tags, notes, meetings, events    workspace CRUD
 ```
-
-### Critical columns on `documents`
-
-| Group | Columns |
-|-------|---------|
-| Identity | id, uuid, folder, source_file, owner_uuid, is_shared |
-| Content | image_type, company, title, products, contact, key_info, raw_text, full_json, metadata |
-| EXIF GPS | gps_lat, gps_lng, gps_altitude, gps_heading, gps_speed, gps_source, gps_accuracy |
-| Geocode | country, city, address_full |
-| Camera | camera_make, camera_model, lens_model, focal_length, f_number, iso, exposure_time, software, sub_sec_time |
-| Image | img_width, img_height, file_size_kb, image_phash, blur_score, is_blurry, near_dup_of |
-| QR | qr_payloads (JSON), catalog_url |
-| Client | client_timezone, client_user_agent, client_ip, client_timestamp, device_signals |
-| Audit | created_at, updated_at, edit_count, source_channel |
-
-### Critical columns on `contacts`
-
-```
-uuid, document_uuid, document_id, folder, source_file
-company, person, phone, phone_e164, email, website, address
-whatsapp, wechat_id, wechat_qr_url, viber, telegram, line_id, signal_phone
-messengers (JSON), owner_uuid, source_channel
-```
-
-## Auth model
-
-**Email + password only.** Login at `/login`; backend `/api/auth/login` rejects non-email identifiers and ignores `pin_hash`.
-
-| Layer | Detail |
-|-------|--------|
-| Frontend | `<input type="email" autocomplete="email">` — browser validates |
-| Backend | `normalize_identifier()` must return `kind="email"`; phone identifier → 401 |
-| Password | bcrypt 4.0.1 via passlib; PIN field on user table is unused |
-| Session | HttpOnly cookie `kontact_session`, 14-day, itsdangerous-signed |
-| Lockout | 5 fails / 15min → 30min cooldown (`is_locked()`) |
-| Rate limit | 10/min per-IP via slowapi |
-| Legacy | `payload.get('email')` and `payload.get('password')` accepted alongside `{identifier, secret}` |
-
-Phone column (`users.phone_e164`) kept as contact info, not auth. PIN column (`pin_hash`) is dead schema (kept to avoid migration churn).
-
-Super admin bootstrap: `auth.bootstrap_super_admin()` reads `.env` on startup, creates/updates the row.
 
 ## Tenancy model
 
 | Role | Sees |
 |------|------|
 | `super_admin` | everything across all users |
-| `admin` | everything (currently equivalent to super_admin) |
+| `admin` | everything (equivalent to super_admin) |
 | `user` | only rows where `owner_uuid == user.uuid` |
 
 Enforced by:
-- `database.visibility_clause(table_alias, user)` — appended to every visible query
+- `database.visibility_clause(table_alias, user)` — appended to every query
 - Chat SQL tool — UUID-validated, rewrites `documents/contacts/products` → `user_documents/...` TEMP VIEWs filtered by `owner_uuid`
-- Image serve route — joins on `owner_uuid` for non-admin
-- `get_chat_history` — strict `user_uuid` filter
+- Image serve — joins on `owner_uuid` for non-admin
+- `get_chat_history` — strict `user_uuid` filter (no `OR IS NULL` legacy)
+- `/api/queue/batches` — per-user filter (fixed this session)
+
+## Auth model
+
+**Email + password only.** Phone/PIN paths removed.
+
+| Layer | Detail |
+|-------|--------|
+| Frontend | `<input type="email" autocomplete="email">` |
+| Backend | `normalize_identifier()` must return `kind="email"`; phone identifier → 401 |
+| Password | bcrypt 4.0.1 via passlib; PIN column dead schema |
+| Session | HttpOnly cookie `kontact_session`, 14-day, itsdangerous-signed |
+| Lockout | 5 fails / 15min → 30min cooldown |
+| Rate limit | 10/min/IP login; 60/min/user upload; 120/min/user chat (slowapi) |
+| Legacy | `{email, password}` accepted alongside `{identifier, secret}` |
+
+Super admin bootstrap: `auth.bootstrap_super_admin()` reads `.env` at startup.
 
 ## Agent system
 
-### Tool-calling via prompt markers (OpenRouter-compatible)
+Tool-calling via prompt markers (OpenRouter-compatible — no native tool_use):
 
 ```
 LLM outputs:     [TOOL: query_catalog_db]
                   {"sql": "SELECT company, COUNT(*) FROM products GROUP BY company"}
                   [/TOOL]
 
-Backend parses:  _parse_tool_calls() extracts name + args
-Executes:        execute_tool("query_catalog_db", {"sql": "..."}, user=user)
-                 ↓ tenancy rewrite → TEMP VIEW per user
-Returns:         [RESULT: ...] [/RESULT]
-LLM continues:   max 3 tool iterations
+Backend:         _parse_tool_calls() → execute_tool(name, args, user=user)
+                 → UUID validate → TEMP VIEW per user → return markdown
+LLM sees:        [RESULT: ...] [/RESULT]  →  generates final answer
+Max iterations:  3 tool calls per question
 ```
 
-### Tools
+Tools: `query_catalog_db(sql)`, `introspect_schema(table)`, `get_catalog_summary()`
 
-| Tool | Purpose |
-|------|---------|
-| `query_catalog_db(sql)` | Read-only SQL (SELECT/WITH only, blocked keywords + UUID validate), 50-row cap |
-| `introspect_schema(table)` | List tables OR columns/types/samples |
-| `get_catalog_summary()` | Stats: docs, products, contacts, companies, GPS count |
-
-### Memory (3 channels)
-
-| Channel | File | Injected as |
-|---------|------|-------------|
-| Memories | `data/memories.json` | "AGENT MEMORIES" |
-| Approved (rating='up') | `data/feedback.json` | "APPROVED RESPONSES" |
-| Avoid (rating='down') | `data/feedback.json` | "AVOID THESE PATTERNS" |
-| Live | `get_catalog_summary()` | "CATALOG SUMMARY" |
+Memory: `data/memories.json` (manual), `data/feedback.json` (thumb up/down), live `get_catalog_summary()` injected as system context.
 
 ## Pipeline details
 
-### Upload guards (`main.py:upload_images`)
-
-1. Auth check → 401
-2. Rate limit (30/min per IP)
-3. Per-file MIME allowlist + extension whitelist
-4. Safe filename (strip nulls, traversal)
-5. Streamed write w/ 100MB cap (raise 413 mid-stream)
-6. PDF → 200-page cap, split to JPEGs
-7. Queue row created per file w/ `owner_uuid`
-8. Background task → `_process_batch`
+### Upload (`main.py:upload_images`)
+1. Auth + rate limit
+2. Per-file MIME allowlist + extension whitelist + safe filename
+3. Streamed write with 100MB cap (raise 413 mid-stream)
+4. PDF → 200-page cap, split to JPEGs
+5. Storage mirror (`storage.save_file` — no-op local, PUT to S3)
+6. Queue row with `owner_uuid + trade_show`
+7. Background task → `_process_batch`
 
 ### Loader (`pipeline/loader.py:load_image`)
-
 1. PIL open + HEIC support
-2. `extract_exif` (GPS DMS→decimal, lens/camera/exposure, with unit conversion for altitude/speed)
-3. `extract_qr_codes` (pyzbar + cv2 rotation fallback, parsed by type)
-4. `compute_blur` Laplacian variance + `is_blurry` flag
-5. Resize > MAX_PX (4096), base64 encode for LLM
+2. `extract_exif`: GPS DMS→decimal, lens/camera/exposure with unit conversion
+3. `extract_qr_codes`: pyzbar + cv2 + rotation fallback, dispatch to 13 parsers
+4. `compute_blur` + `is_blurry` flag (pre-extractor)
+5. Resize > MAX_PX, base64 encode for LLM
 
 ### Extractor (`pipeline/extractor.py:extract_one`)
+1. **`is_blurry`?** → short-circuit `image_type="blurry"`, no LLM (saves tokens, prevents hallucination)
+2. Classifier (Gemini 3.1 Flash Lite, temp=0)
+3. Specialized agent vision call (8 prompts)
+4. **Merge QR**: vCard/MeCard overlay, messenger promotion, payload JSON
+5. **Propagate loader meta**: merge EXIF into `data["metadata"]` so flat columns populate
 
-1. **If `is_blurry`**: short-circuit → `image_type="blurry"`, no LLM call, returns stub (saves tokens, prevents hallucination)
-2. Classifier vision call (Gemini 3.1 Flash Lite, 4000 tokens, temp=0)
-3. Specialized agent vision call (8 prompts: product_page, contact_card, qr_card, business_card, price_list, brochure, certification, other)
-4. **Merge QR**: vCard overlay, messenger promotion, qr_payloads JSON
-5. **Propagate loader meta**: merge `meta` into `data["metadata"]` so EXIF columns get populated downstream
+### URL resolver (`pipeline/url_resolver.py`)
+Triggered in `_process_batch` for `qr_type == "url"`.
+- SSRF guard (private/loopback/link-local/`.local`)
+- httpx 8s timeout, 2MB cap, 4 redirects
+- JSON-LD Person/Organization → name/phone/email/address/jobTitle/sameAs
+- OG meta → name/company/image
+- mailto/tel/social hosts
+- Regex fallback + phone E.164 normalization
 
-### URL resolver (`pipeline/url_resolver.py:resolve_profile_url`)
+### Auto-tagging (`pipeline/tagger.py:suggest_tags`)
+Heuristic. No extra LLM call. Returns up to 6:
+- Content type from `image_type`
+- Industry from keyword match
+- Region from geocoded country
+- Signal flags (has-qr / has-messenger / has-phone / has-email / has-pricing)
 
-Triggered in `_process_batch` for each `qr_type == "url"` payload.
-
-| Stage | Detail |
-|-------|--------|
-| SSRF guard | block loopback, private, link-local, multicast, `.local`, `.internal` |
-| Fetch | httpx 8s timeout, 2MB cap, 4 redirects, browser UA, must be html/xml |
-| JSON-LD | Person/Organization/LocalBusiness → name/phone/email/address/jobTitle/sameAs |
-| OG meta | og:title→name, og:site_name→company, og:image |
-| Links | `mailto:` → email, `tel:` → phone, social hosts → social[] |
-| Regex | email + phone fallback on stripped text |
-| Normalize | phone → E.164 via phonenumbers (multi-region) |
-
-Merges into `contact` w/o overwriting truthy. Sets `catalog_url` on document.
+### Currency parsing (`pipeline/pricing.py:parse_price`)
+Returns `(ISO_4217, float)`:
+- Symbol prefix/suffix (`$`, `€`, `¥`, `£`, `₹`, `₩`, `R$`, `HK$`, `C$`, `A$`, `S$`, `NT$`, `Mex$`, `₽`, `฿`, `₫`)
+- Word/ISO match (`USD`, `EUR`, `RMB`, `元`, `RUPEE`, `YEN`, …)
+- Smart decimal/thousand separator handling (US `1,234.56` vs EU `1.234,56`)
 
 ### Insert (`database.insert_extraction`)
-
-- Single INSERT into documents (NO `INSERT OR REPLACE` — FK collision risk; UNIQUE `file_hash` index dropped)
-- Loop products → INSERT (skip dups on error)
+- Single INSERT into documents (NO `INSERT OR REPLACE` — FK collision risk)
+- Loop products → INSERT with `currency` + `price_amount` (parsed)
 - Loop contact fields → `upsert_contact` (separate conn, sees committed doc)
-- `_commit()` once at end
+- Single `commit()` at end
 
-## Security
+## Storage backend (`storage.py`)
 
-| Layer | Detail |
-|-------|--------|
-| `SESSION_SECRET` | Startup `RuntimeError` if missing, `<32 chars`, or in placeholder set |
-| CORS | `CORS_ORIGINS` env, no `*` w/ credentials |
-| Cookie | `httponly`, `samesite=lax`, `secure` env-controlled (`true` in prod) |
-| Bcrypt | `bcrypt==4.0.1` pinned — DO NOT bump to 5.x without testing passlib 1.7.5+ |
-| SQL injection | UUID strict regex + `uuid.UUID()` parse before TEMP VIEW interpolation |
-| Path traversal | `_safe_under()` realpath check; null-byte block |
-| Image ownership | doc.owner_uuid join (or super_admin bypass) |
-| Upload | MIME allowlist, 100MB cap, safe filename, PIL `MAX_IMAGE_PIXELS=100M` |
-| PDF | 200-page cap |
-| OpenRouter | 3× exp-backoff retry on 429/5xx/network |
-| SSRF | url_resolver IP family block |
-| Rate limit | slowapi: 10/min login, 30/min upload, 60/min chat |
-| FK enforced | `PRAGMA foreign_keys=ON` on every connection |
-| Chroma | daily `prune_orphans` cron + `delete_by_folder` on batch delete |
-| Audit | `audit_events` table logs upload/login/edit/delete/share/merge |
+Pluggable. API: `save_file`, `save_bytes`, `open_stream`, `get_local_path`, `delete`, `delete_prefix`, `exists`, `presigned_url`, `backend_name`.
+
+| `STORAGE_BACKEND` | Behavior |
+|-------------------|----------|
+| `local` (default) | writes to `data/uploads/`, FastAPI streams via FileResponse |
+| `s3` | writes to AWS S3 / R2 / B2 / MinIO / Wasabi; image serve redirects to presigned URL (10-min) |
+
+Upload path: write to local `batch_dir` (always — pipeline needs PIL/QR/EXIF), then `storage.save_file()` mirrors to remote. Cascading delete on `/api/batch/{id}` removes SQLite + Chroma + storage prefix.
+
+Migration script: `migrate_to_s3.py` walks `data/uploads/` and pushes each file. Idempotent (head_object check).
+
+## Backup + restore
+
+| Script | Purpose |
+|--------|---------|
+| `backup.sh` | WAL checkpoint → docker cp data → bundle `.env` + manifest → `.tar.gz` |
+| `restore.sh` | Stop container → restore .env (keeps pre-restore copy) → overwrite /app/data → restart |
+
+Tested: 2MB archive on dev (18 docs, 8 products, 50 chat msgs). Backups gitignored.
 
 ## API endpoints
 
 ```
 # Auth
-POST   /api/auth/login          -- 10/min rate limit
+POST   /api/auth/login              email + password, 10/min/IP
 POST   /api/auth/logout
 GET    /api/auth/me
 
 # Users (admin-only)
-GET    /api/users
-POST   /api/users               -- create w/ password+pin
-PATCH  /api/users/{uuid}
-DELETE /api/users/{uuid}
+GET POST PATCH DELETE /api/users{/uuid}
 
 # Upload + queue
-POST   /api/upload              -- 60/min/user, MIME+size+bomb guards, owner_uuid stamped
-                                   accepts form field: trade_show
-GET    /api/queue/batches       -- per-user (admin: all)
+POST   /api/upload                  60/min/user, accepts trade_show form field
+GET    /api/queue/batches           per-user filtered
+GET    /api/queue                   status counts
 POST   /api/queue/retry/{id}
-DELETE /api/batch/{id}          -- cascades to chroma + S3 prefix via delete_by_folder
-POST   /api/process/background
+DELETE /api/batch/{id}              cascades DB + Chroma + storage
 
-# Chat agent
-POST   /api/chat                -- 120/min/user, SQL tool loop
-POST   /api/chat/stream         -- SSE: session, tool_call, tool_result, chunk, done
-GET    /api/chat/sessions       -- per-user
+# Chat
+POST   /api/chat                    120/min/user, SQL tool loop
+POST   /api/chat/stream             SSE
+GET    /api/chat/sessions           per-user
+GET    /api/chat/history/{sid}
+DELETE /api/chat/sessions/{sid}
 
 # Data + filters
-GET    /api/data                -- documents (owner-scoped)
-                                   query: ?trade_show=&country=&has_qr=&has_gps=
+GET    /api/data?trade_show=&country=&has_qr=&has_gps=
 GET    /api/documents/{id}
-GET    /api/products            -- now includes currency + price_amount cols
+GET    /api/products                includes currency + price_amount
 GET    /api/contacts
-GET    /api/contacts/duplicates -- phone_e164/email dedup suggestions
-POST   /api/contacts/merge      -- keep_uuid + drop_uuid; rewires notes/meetings
-GET    /api/contacts/{uuid}/vcard -- RFC 6350 .vcf download
-GET    /api/export/vcards.zip   -- bulk vCards
-GET    /api/dashboard
-GET    /api/search?q=           -- FTS5
-GET    /api/search/semantic?q=  -- ChromaDB
+GET    /api/contacts/duplicates     dedup suggestions (phone_e164/email)
+POST   /api/contacts/merge          keep_uuid + drop_uuid
+GET    /api/contacts/{uuid}/vcard   .vcf download
+PATCH  /api/contacts/{uuid}
+DELETE /api/contacts/{uuid}
+GET    /api/export/vcards.zip       bulk
+GET    /api/search?q=               FTS5
+GET    /api/search/semantic?q=      ChromaDB
 
 # 12 aggregations
 GET    /api/aggregations/{locations,countries,timeline,cameras,messengers,
@@ -306,7 +245,7 @@ GET    /api/aggregations/{locations,countries,timeline,cameras,messengers,
 # Workspace CRUD
 {GET POST PATCH DELETE} /api/{tags,notes,meetings,events}
 
-# Image (auth + ownership + realpath)
+# Image (auth + ownership + realpath; S3 backend redirects to presigned)
 GET    /api/image/{folder}/{filename:path}
 
 # Export
@@ -315,22 +254,24 @@ GET    /api/export/{xlsx,csv,json}
 # Other
 POST   /api/feedback
 GET    /api/memories
-GET    /api/config              -- gated
-GET    /health                  -- public
+GET    /api/config                  auth-gated
+GET    /health                      public
 ```
 
 ## Frontend
 
 | Route | Purpose |
 |-------|---------|
-| `/login` | email + password only, show-pw toggle, remember-me (localStorage base64) |
-| `/upload` | hero camera + 3 inputs (camera capture / library / files), exifr@7.1.3, browser geo, sticky upload bar |
-| `/queue` | batch rows, inline thumbnails, retry/delete, toast, terminal |
+| `/login` | email + password only, show-pw toggle, remember-me |
+| `/upload` | hero camera + 3 inputs (camera capture / library / files), trade-show input (persisted), exifr@7.1.3 client EXIF, browser geo, auto-submit + auto-redirect |
+| `/queue` | batch rows, inline thumbnails → **lightbox** with full image + side panel, retry/delete, toast |
 | `/chat` | SSE streaming, RAG ANALYZING animation, tool steps, image citations, thumbs feedback, voice input, export |
-| `/data` | 3-section grouped nav (sticky), 20 tabs, hash sync |
+| `/data` | 3-section grouped nav (Catalog 7 / Insights 10 / Workspace 3) — 20 tabs total |
 | `/users` | admin CRUD |
 
-20 tabs split:
+Layout-wide: PWA install banner via `beforeinstallprompt` (dismiss persisted).
+
+Tabs:
 - **Catalog** (7): Documents, Products, Contacts, Companies, Categories, Specs, Gallery
 - **Insights** (10): LocationsMap (Leaflet), Timeline, Countries, Messengers, QrCodes, Quality, Duplicates, SyncSources, Cameras, Pricing
 - **Workspace** (3): Tags, Notes, Meetings
@@ -344,158 +285,143 @@ GET    /health                  -- public
 | LLM | Gemini 3.1 Flash Lite via OpenRouter |
 | Embeddings | OpenAI text-embedding-3-small via OpenRouter |
 | DB | SQLite WAL + FTS5 |
-| Vectors | ChromaDB |
-| Auth | bcrypt 4.0.1 + passlib 1.7.4 + itsdangerous 2.2.0 + phonenumbers 8.13.50 |
+| Vectors | ChromaDB (daily prune) |
+| Storage | local OR boto3 (S3/R2/B2/MinIO/Wasabi) |
+| Auth | bcrypt 4.0.1 PINNED + passlib 1.7.4 + itsdangerous + phonenumbers |
 | QR | pyzbar 0.1.9 + opencv-python 4.10.0.84 |
-| Image | Pillow 11.1.0 + pillow-heif 0.21.0 + imagehash 4.3.1 + PyMuPDF 1.25.3 |
+| Image | Pillow 11.1.0 + pillow-heif + imagehash + PyMuPDF |
 | HTTP | httpx 0.28.1 |
 | Parse | beautifulsoup4 4.12.3 |
-| Rate limit | slowapi 0.1.9 |
-| MIME | python-magic 0.4.27 |
-| Deploy | Docker (multi-stage) + Caddy 2-alpine |
-| PWA | manifest + service worker (network-first) |
+| Rate limit | slowapi 0.1.9 (per-user keying) |
+| Deploy | Docker multi-stage + Caddy 2-alpine (auto Let's Encrypt) |
 
-## Configuration (.env)
+## Configuration
 
-| Variable | Default | Required | Purpose |
-|----------|---------|----------|---------|
-| `OPENROUTER_API_KEY` | — | YES | LLM |
-| `SESSION_SECRET` | — | YES, ≥32 chars | Fails startup if missing/placeholder |
-| `SUPER_ADMIN_EMAIL` | — | YES | Bootstrap admin email (used for login) |
-| `SUPER_ADMIN_PASSWORD` | — | YES | Bootstrap admin password |
-| `SUPER_ADMIN_NAME` | `Super Admin` | | Display name |
-| `SESSION_DAYS` | 14 | | Cookie lifetime |
-| `COOKIE_SECURE` | auto | | `true` for HTTPS prod |
-| `CORS_ORIGINS` | http://localhost:8090 | | Comma-separated; `*` disables credentials |
-| `MAX_UPLOAD_BYTES` | 104857600 | | 100MB per file |
-| `MAX_IMAGE_PIXELS` | 100000000 | | PIL bomb guard |
-| `RATE_LIMIT_ENABLED` | true | | slowapi toggle |
-| `DOMAIN` | kontact.example.com | | Caddy TLS |
-| `VISION_MODEL` | google/gemini-3.1-flash-lite-preview | | |
-| `EMBEDDING_MODEL` | openai/text-embedding-3-small | | |
-| `MAX_WORKERS` | 8 | | Extraction concurrency |
-| `PORT` | 8000 | | |
-| `WECHAT_WATCH_DIR` | — | | Auto-start WeChat watcher |
+| Variable | Default | Required |
+|----------|---------|----------|
+| `OPENROUTER_API_KEY` | — | YES |
+| `SESSION_SECRET` | — | YES, ≥32 chars |
+| `SUPER_ADMIN_EMAIL` | — | YES |
+| `SUPER_ADMIN_PASSWORD` | — | YES |
+| `SUPER_ADMIN_NAME` | "Super Admin" | |
+| `SESSION_DAYS` | 14 | |
+| `COOKIE_SECURE` | auto | `true` in prod |
+| `CORS_ORIGINS` | localhost | comma-sep |
+| `MAX_UPLOAD_BYTES` | 104857600 | 100MB |
+| `MAX_IMAGE_PIXELS` | 100000000 | PIL bomb guard |
+| `RATE_LIMIT_ENABLED` | true | |
+| `STORAGE_BACKEND` | local | `s3` for cloud |
+| `S3_BUCKET / S3_ENDPOINT_URL / S3_REGION / S3_PREFIX / S3_PUBLIC_BASE_URL` | — | for s3 |
+| `DOMAIN` | kontact.example.com | Caddy TLS |
+| `VISION_MODEL` | google/gemini-3.1-flash-lite-preview | |
+| `EMBEDDING_MODEL` | openai/text-embedding-3-small | |
+| `MAX_WORKERS` | 8 | extraction concurrency |
+| `PORT` | 8090 | |
 
-## Hardening landmarks (this session)
+## Hardening landmarks (this session — 35 items)
 
-### 🔴 5 CRITICAL (security)
+### 🔴 5 CRITICAL security
 - C1 `SESSION_SECRET` rotated + enforce ≥32 chars at startup
 - C2 CORS env-driven; no wildcard with credentials
-- C3 UUID strict-validated before TEMP VIEW SQL interpolation (`tools.py`)
-- C4 Path traversal: `realpath` + `_safe_under(UPLOADS_DIR)` + null-byte block
-- C5 Image ownership: `owner_uuid` join, non-admin can't see others' images
+- C3 UUID strict-validated before TEMP VIEW SQL interpolation
+- C4 Path traversal: realpath + `_safe_under(UPLOADS_DIR)` + null-byte block
+- C5 Image ownership: owner_uuid join, non-admin can't see others' images
 
 ### 🟠 8 HIGH
-- H1 Upload size cap (streaming check, 413 on overflow)
-- H2 PIL bomb guard (`MAX_IMAGE_PIXELS=100M`)
+- H1 Upload size cap (streaming check, 413 mid-stream)
+- H2 PIL bomb guard `MAX_IMAGE_PIXELS=100M`
 - H3 MIME allowlist + safe filename sanitizer
 - H4 OpenRouter 3× exp-backoff retry on 429/5xx/network
-- H5 `PRAGMA foreign_keys=ON` + dropped UNIQUE `file_hash` (FK collision)
-- H7 `COOKIE_SECURE` env-driven
+- H5 `PRAGMA foreign_keys=ON` + dropped UNIQUE file_hash (FK collision)
+- H7 Cookie `secure` env-driven
 - H8 ChromaDB `prune_orphans` daily cron + `delete_by_folder` on batch delete
-- (H6 passlib bump deferred — tested, 1.7.4 + bcrypt 4.0.1 stable)
+- (H6 passlib bump deferred — 1.7.4 + bcrypt 4.0.1 stable)
 
 ### 🟡 5 MEDIUM
-- M1 Specific exception types in pipeline loader (log w/ context)
-- M2 slowapi rate limits (10/30/60 per min on login/upload/chat)
-- M3 `/api/config` already gated by `current_user`
-- M4 PDF page cap 200 + PIL pixel cap covers oversize
+- M1 Specific exception types in pipeline (log w/ context)
+- M2 slowapi per-user keying (login 10/min/IP, upload 60/min/user, chat 120/min/user)
+- M3 `/api/config` already gated
+- M4 PDF page cap 200 + PIL pixel cap
 - M5 `get_chat_history` strict `user_uuid` (removed `OR IS NULL` leak)
 
 ### 🐛 4 functional bugs
-- **B1 GPS EXIF**: Extractor wasn't propagating loader meta → `data["metadata"]`. Plus FK collision on file_hash UNIQUE blocked inserts. Now extracted GPS + camera + lens + ISO + geocode all land. Test: B_gps.jpg → gps_lat=31.2304, country=中国, city=上海市.
-- **B3 blur hallucination**: F_blur.jpg invented `$8,850` for real `$4,850`. Loader now pre-computes blur; extractor short-circuits on `is_blurry`, marks `image_type="blurry"`, no LLM call, no fake products.
-- **Messengers agg empty**: Read flat platform cols (whatsapp/wechat_qr_url/viber/telegram/line_id/signal_phone) in addition to messengers JSON.
-- **WhatsApp invite parser**: `wa.me/qr/CODE` was extracting "qr" as phone. Now detects `/qr/<code>` and `/message/<code>` patterns, stores `invite_code`, leaves phone null.
+- **B1 GPS EXIF**: extractor wasn't propagating loader meta + file_hash UNIQUE collision blocked inserts. Fixed both. Test: B_gps.jpg → gps_lat=31.2304, country=中国, city=上海市.
+- **B3 blur hallucination**: F_blur.jpg invented `$8,850` for real `$4,850`. Loader now pre-computes blur; extractor short-circuits, no fake products.
+- **Messengers agg empty**: now reads flat platform cols + JSON blob.
+- **WhatsApp invite parser**: `wa.me/qr/CODE` was extracting "qr" as phone. Now detects `/qr/` and `/message/` patterns.
 
 ### ✨ 13 features
-- **URL profile resolver**: SSRF-safe HTTP fetch + JSON-LD/OG/microdata/regex extraction. URL-type QRs now enrich contacts (test: GitHub QR → "Linus Torvalds" + "GitHub").
-- **ChromaDB pruner**: Daily orphan vector cleanup + cascade delete.
-- **Email-only login**: simplified auth surface — frontend locked to `type=email`, backend rejects non-email identifiers and ignores PIN.
-- **Auto-submit upload + auto-redirect**: pick file → instantly POST → 900ms confirmation → `/queue`. One-tap on mobile.
-- **Per-user queue privacy**: `/api/queue/batches` filters by `owner_uuid` for non-admin.
-- **Backup + restore scripts** (`backup.sh`, `restore.sh`): single-archive snapshot of DB + Chroma + uploads + `.env`. WAL-checkpointed.
-- **S3 storage backend** (`storage.py`): opt-in via `STORAGE_BACKEND=s3`. AWS / R2 / B2 / MinIO / Wasabi. Migration script `migrate_to_s3.py`.
-- **13 new QR/barcode formats**: MeCard, VEVENT (→ auto-meeting row), GeoURL (→ overrides GPS if EXIF missing), WiFi, tel/mailto/sms, EPC SEPA, UPI, PIX, Bitcoin, Ethereum, Threads, Kakao `pf.kakao.com`, plus 1D barcodes (EAN13/UPCA/CODE128 via pyzbar symbology).
-- **Trade-show grouping**: `documents.trade_show` + `queue.trade_show`, threaded from upload form. `/api/aggregations/trade-shows` returns labels with counts. localStorage persists last value on upload page.
-- **AI auto-tagging** (`pipeline/tagger.py`): heuristic 3-6 tags applied after each insert (industry, region, content type, signal flags). No extra LLM call.
-- **Currency normalization** (`pipeline/pricing.py`): parse free-form prices → `products.currency` (ISO code) + `products.price_amount` (numeric).
-- **Contact merge + dedup**: `/api/contacts/duplicates` groups by phone_e164/email. `/api/contacts/merge` rewires notes/meetings, deletes drop.
-- **vCard export per contact**: `/api/contacts/{uuid}/vcard` returns RFC 6350 `.vcf` (opens directly in iOS/Android Contacts).
-- **Quick filters on /api/data**: `?trade_show=` `?country=` `?has_qr=` `?has_gps=`.
-- **PWA install banner**: `beforeinstallprompt` → dismissible bottom banner with Install button.
-- **Image lightbox in queue**: thumbnail click → full image + metadata panel (filename, type, company, trade-show chip, contact, products + prices, GPS, camera, date). Esc/backdrop closes.
+- **URL profile resolver** (SSRF-safe JSON-LD/OG extraction; tested w/ GitHub QR → "Linus Torvalds")
+- **ChromaDB pruner** (daily cron + cascade delete)
+- **Email-only login** (frontend locked, backend rejects non-email + ignores PIN)
+- **Auto-submit upload + auto-redirect to /queue** (one-tap mobile)
+- **Per-user queue privacy** (queue_batches filtered)
+- **Backup + restore scripts** (single-archive snapshot)
+- **S3 storage backend** (boto3, AWS/R2/B2/MinIO/Wasabi, migrate_to_s3.py)
+- **13 new QR/barcode formats**: MeCard, VEVENT (→meeting row), GeoURL, WiFi, tel/mailto/sms, EPC SEPA, UPI, PIX, Bitcoin, Ethereum, Threads, Kakao pf.kakao.com, plus 1D barcodes via pyzbar symbology
+- **Trade-show grouping** (column + form input + /api/aggregations/trade-shows)
+- **AI auto-tagging** (heuristic 3-6 tags applied after every insert)
+- **Currency normalization** (parse_price → currency + price_amount cols)
+- **Contact merge + dedup** (/api/contacts/duplicates + /merge + vCard download)
+- **Quick filters** (/api/data?trade_show=&country=&has_qr=&has_gps=)
+- **PWA install banner** (beforeinstallprompt + dismissible)
+- **Image lightbox in queue** (click thumb → full image + side panel)
 
-## Storage backend
+## Pitfalls
 
-`storage.py` — pluggable file storage. Single API: `save_file`, `save_bytes`, `open_stream`, `get_local_path`, `delete`, `delete_prefix`, `exists`, `presigned_url`, `backend_name`.
-
-| `STORAGE_BACKEND` | Behavior |
-|-------------------|----------|
-| `local` (default) | writes to `data/uploads/` on disk, FastAPI streams via FileResponse |
-| `s3` | writes to AWS S3 / R2 / B2 / MinIO / Wasabi; image serve redirects to presigned URL (10-min expiry) |
-
-Upload path: write to local `batch_dir` (always — pipeline needs local file for PIL/QR/EXIF), then `storage.save_file()` mirrors to remote. For local backend this is a no-op (same path).
-
-Migration (`migrate_to_s3.py`): walks existing `data/uploads/` and pushes each file. Idempotent — skips via `head_object`. Run once after switching backend.
-
-Cascading delete: `/api/batch/{id}` removes from SQLite + Chroma + `storage.delete_prefix(batch_id)`.
-
-## Pitfalls / things to know
-
-- **Login is email + password only** — phone/PIN paths removed. `users.pin_hash` still exists in DB but never read by login. Don't re-enable PIN auth without also tightening rate limits (4-digit space is brute-forceable).
-- **Bcrypt 4.0.1 PINNED** — passlib 1.7.4 breaks with bcrypt 5.x ("password cannot be longer than 72 bytes")
-- **INSERT OR REPLACE deleted** — FK to products/contacts cascades to constraint failure. Use upsert by `(folder, source_file)` only.
-- **`file_hash` index** — now plain (not UNIQUE) to avoid REPLACE collision when same image uploaded in different batches
-- **Caddy profile opt-in** — `docker compose --profile https up -d` only. Default `docker compose up` = just kontact on 8090.
-- **WhatsApp `wa.me/qr/<code>`** — phone NOT extractable without authenticated WA session (ToS-violating). Stores invite deeplink; user resolves via WhatsApp app.
-- **Blurry images** — extractor SKIPS LLM call, marks image_type=blurry. Saves tokens + prevents hallucinated specs.
-- **TEMP VIEW lifecycle** — created per chat-tool call, dropped via DROP VIEW IF EXISTS. UUID validate is critical (defense in depth).
+- **Login is email + password only** — phone/PIN paths removed. `users.pin_hash` exists in DB but never read. Don't re-enable PIN without rate-limit tightening (4-digit space is brute-forceable).
+- **Bcrypt 4.0.1 PINNED** — passlib 1.7.4 breaks with bcrypt 5.x ("password cannot be longer than 72 bytes").
+- **INSERT OR REPLACE forbidden** — FK to products/contacts cascades to constraint failure. Use upsert by (folder, source_file) only.
+- **`file_hash` index** — plain (not UNIQUE) to avoid REPLACE collision when same image uploaded in different batches.
+- **Caddy profile opt-in** — `docker compose --profile https up -d`. Default `docker compose up` = just kontact on 8090.
+- **WhatsApp `wa.me/qr/<code>`** — phone NOT extractable without authenticated WA session (ToS-violating). Stores invite deeplink.
+- **Blurry images** — extractor SKIPS LLM call, marks `image_type=blurry`. Saves tokens + prevents hallucination.
+- **TEMP VIEW lifecycle** — created per chat-tool call, dropped via DROP VIEW IF EXISTS. UUID validate critical (defense in depth).
 - **Background EXIF** — server-side `extract_exif()` runs in container; if browser strips EXIF, client-side `exifr@7.1.3` sidecar fills gaps.
+- **slowapi per-user keying** — uses session cookie UUID. Falls back to IP if no auth cookie (login).
 
-## Quick test recipe
+## Capacity
+
+| Team size | Action |
+|-----------|--------|
+| 1–10 | as-is, single uvicorn worker |
+| 10–50 | Dockerfile `--workers 4` |
+| 50–500 | migrate SQLite → Postgres |
+| 500+ | multi-container + Redis + Postgres + S3 + pgvector |
+
+## Test fixtures
+
+`/tmp/kontact_test/make_fixtures.py` generates A–V QR test images:
+- A_catalog plain page, B_gps with EXIF GPS, C_qr_url, D_qr_vcard, E_qr_wechat
+- F_blur, G_dup, H_qr_github (URL resolver test)
+- I_qr_example, J_qr_mecard, K_qr_vevent, L_qr_geo
+- M_qr_wifi, N_qr_tel, O_qr_email, P_qr_sms
+- Q_qr_upi, R_qr_epc, S_qr_btc, T_qr_kakao
+- U_qr_zalo, V_qr_threads
+
+Regenerate: `/Users/rahulgupta/.venv/bin/python3 /tmp/kontact_test/make_fixtures.py`
+
+## Quick smoke test
 
 ```bash
-# Smoke test post-changes
 docker compose up -d --build kontact && sleep 8
 
-# Login
-curl -s -c /tmp/jar -X POST localhost:8090/api/auth/login \
+curl -s -c /tmp/jar -X POST http://localhost:8090/api/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"identifier":"admin@kontact.local","secret":"<your-pwd>"}' | jq .uuid
+  -d '{"identifier":"admin@kontact.local","secret":"KontactAdmin2026!"}' | jq .uuid
 
-# Upload synthetic fixture
-curl -s -b /tmp/jar -X POST localhost:8090/api/upload \
-  -F "files=@/tmp/kontact_test/B_gps.jpg"
+curl -s -b /tmp/jar -X POST http://localhost:8090/api/upload \
+  -F "files=@/tmp/kontact_test/B_gps.jpg" \
+  -F "trade_show=CES 2026"
 
-# Wait for processing
-for i in {1..10}; do
-  curl -s -b /tmp/jar localhost:8090/api/queue/batches | head -c 200
-  sleep 5
-done
+sleep 8
 
-# Verify GPS landed
 docker compose exec kontact python3 -c "
 import sqlite3; c=sqlite3.connect('/app/data/kontact.db')
-for r in c.execute('SELECT folder,source_file,gps_lat,country,city FROM documents ORDER BY id DESC LIMIT 3'):
+for r in c.execute('SELECT source_file, gps_lat, country, city, trade_show FROM documents ORDER BY id DESC LIMIT 3'):
     print(r)
 "
 ```
-
-## Synthetic fixtures (testing)
-
-In `/tmp/kontact_test/make_fixtures.py`:
-- A_catalog.jpg — plain catalog page
-- B_gps.jpg — with EXIF GPS (Shanghai 31.2304, 121.4737)
-- C_qr_url.jpg — URL QR
-- D_qr_vcard.jpg — vCard QR (Zhang Wei, Beijing Tech, +8613912345678)
-- E_qr_wechat.jpg — WeChat URL QR
-- F_blur.jpg — blurred (should skip extraction)
-- G_dup.jpg — near-dup of A
-- H_qr_github.jpg — GitHub profile URL (resolver test)
-
-Generate: `/Users/rahulgupta/.venv/bin/python3 /tmp/kontact_test/make_fixtures.py`
 
 ## Deploy
 
@@ -503,10 +429,11 @@ Generate: `/Users/rahulgupta/.venv/bin/python3 /tmp/kontact_test/make_fixtures.p
 # Dev (HTTP only, port 8090)
 docker compose up -d --build kontact
 
-# Prod (HTTPS via Caddy + Let's Encrypt)
-# Edit .env: DOMAIN, COOKIE_SECURE=true, CORS_ORIGINS=https://yourdomain
+# Prod (HTTPS via Caddy)
+# Set in .env: DOMAIN=, COOKIE_SECURE=true, CORS_ORIGINS=https://yourdomain
 docker compose --profile https up -d
 
-# Healthcheck
+# Verify
 curl http://localhost:8090/health
+docker compose logs -f kontact
 ```
