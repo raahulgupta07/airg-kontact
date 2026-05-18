@@ -29,3 +29,12 @@ frontend/build/
 
 # Docker
 *.log
+
+# Binary docs (deck/PDFs) — keep out of git
+*.pptx
+*.pdf
+*.docx
+*.xlsx
+!data/extractions/*.json
+KONTACT_Deep_Dive*
+kontact-overview*

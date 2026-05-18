@@ -16,12 +16,12 @@
   let toast = $state(null);
 
   const api = {
-    async getQueueBatches() { const r = await fetch('/api/queue/batches'); return r.json(); },
-    async processQueue(bid = null) { const r = await fetch(bid ? `/api/process/background?batch_id=${bid}` : '/api/process/background', { method: 'POST' }); if (!r.ok) { const e = await r.json().catch(() => ({ detail: 'Failed' })); throw new Error(e.detail); } return r.json(); },
-    async getQueueStatus(bid = null) { const r = await fetch(bid ? `/api/queue?batch_id=${bid}` : '/api/queue'); return r.json(); },
-    async getQueueErrors(bid = null) { const r = await fetch(bid ? `/api/queue/errors?batch_id=${bid}` : '/api/queue/errors'); return r.ok ? r.json() : []; },
-    async retryItem(qid) { const r = await fetch(`/api/queue/retry/${qid}`, { method: 'POST' }); if (!r.ok) throw new Error('Retry failed'); return r.json(); },
-    async deleteBatch(bid) { const r = await fetch(`/api/batch/${bid}`, { method: 'DELETE' }); if (!r.ok) { const e = await r.json().catch(() => ({ detail: 'Failed' })); throw new Error(e.detail); } return r.json(); }
+    async getQueueBatches() { const r = await fetch('/api/queue/batches', { credentials: 'include' }); return r.json(); },
+    async processQueue(bid = null) { const r = await fetch(bid ? `/api/process/background?batch_id=${bid}` : '/api/process/background', { method: 'POST', credentials: 'include' }); if (!r.ok) { const e = await r.json().catch(() => ({ detail: 'Failed' })); throw new Error(e.detail); } return r.json(); },
+    async getQueueStatus(bid = null) { const r = await fetch(bid ? `/api/queue?batch_id=${bid}` : '/api/queue', { credentials: 'include' }); return r.json(); },
+    async getQueueErrors(bid = null) { const r = await fetch(bid ? `/api/queue/errors?batch_id=${bid}` : '/api/queue/errors', { credentials: 'include' }); return r.ok ? r.json() : []; },
+    async retryItem(qid) { const r = await fetch(`/api/queue/retry/${qid}`, { method: 'POST', credentials: 'include' }); if (!r.ok) throw new Error('Retry failed'); return r.json(); },
+    async deleteBatch(bid) { const r = await fetch(`/api/batch/${bid}`, { method: 'DELETE', credentials: 'include' }); if (!r.ok) { const e = await r.json().catch(() => ({ detail: 'Failed' })); throw new Error(e.detail); } return r.json(); }
   };
 
   async function fetchBatches() { loading = true; try { batches = await api.getQueueBatches(); } catch (e) { log(`ERROR: ${e.message}`); } finally { loading = false; } }
@@ -48,7 +48,7 @@
 
   function showToast(message) {
     toast = message;
-    setTimeout(() => { toast = null; }, 5000);
+    setTimeout(() => { toast = null; }, 3000);
   }
 
   async function deleteBatch(bid) {
@@ -69,7 +69,7 @@
         clearInterval(pollTimer); pollTimer = null; log('Complete.'); processing = false;
         const batchName = activeBatch || 'All';
         const totalDone = status.done ?? doneCount;
-        showToast(`Batch ${batchName} processed successfully! ${totalDone} images done.`);
+        showToast(`Batch ${batchName} processed. ${totalDone} images done.`);
         activeBatch = null;
       }
     }, 3000);
@@ -93,7 +93,7 @@
   async function toggleExpand(bid) {
     if (expandedBatch === bid) { expandedBatch = null; expandedData = []; return; }
     try {
-      const r = await fetch(`/api/data?folder=${bid}`);
+      const r = await fetch(`/api/data?folder=${bid}`, { credentials: 'include' });
       const raw = await r.json();
       expandedData = raw.map(d => ({
         ...d,
@@ -112,7 +112,7 @@
   function totalPending() { return batches.reduce((s, b) => s + (b.pending ?? 0), 0); }
 </script>
 
-<svelte:head><title>QUEUE | KONTACT</title></svelte:head>
+<svelte:head><title>Queue | KONTACT</title></svelte:head>
 
 <div class="q-page">
   {#if toast}
@@ -120,13 +120,13 @@
   {/if}
   <div class="q-header">
     <div class="q-title-row">
-      <h1>QUEUE</h1>
+      <h1 class="page-title">Queue</h1>
       <span class="q-count">{batches.length} batches · {batches.reduce((s,b) => s + (b.done??0) + (b.pending??0) + (b.errors??0), 0)} images</span>
     </div>
     <div class="q-actions">
-      <button class="q-btn q-btn-outline" onclick={fetchBatches} disabled={loading}>{loading ? '...' : 'REFRESH'}</button>
+      <button class="btn-ghost" onclick={fetchBatches} disabled={loading}>{loading ? '...' : 'Refresh'}</button>
       {#if totalPending() > 0}
-        <button class="q-btn q-btn-primary" onclick={processAll} disabled={processing}>{processing ? 'PROCESSING...' : `PROCESS ALL (${totalPending()})`}</button>
+        <button class="send-btn" onclick={processAll} disabled={processing}>{processing ? 'Processing...' : `Process all (${totalPending()})`}</button>
       {/if}
     </div>
   </div>
@@ -134,23 +134,23 @@
   {#if batches.length === 0 && !loading}
     <div class="q-empty">
       <p>No batches yet</p>
-      <button class="q-btn q-btn-primary" onclick={() => goto('/upload')}>UPLOAD IMAGES</button>
+      <button class="send-btn" onclick={() => goto('/upload')}>Upload images</button>
     </div>
   {:else}
     <div class="q-list">
       {#each batches as batch (batch.batch_id)}
         {@const total = (batch.done ?? 0) + (batch.pending ?? 0) + (batch.errors ?? 0)}
         {@const pct = total > 0 ? Math.round(((batch.done ?? 0) / total) * 100) : 0}
-        <div class="q-row">
+        <div class="card q-row">
           <div class="q-row-main">
             <div class="q-row-left">
-              <span class="q-row-icon" class:q-complete={pct === 100} class:q-active={processing && activeBatch === batch.batch_id}>
+              <span class="q-row-icon" class:q-complete={pct === 100}>
                 {#if processing && activeBatch === batch.batch_id}
                   <span class="q-spinner"></span>
                 {:else if pct === 100}
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M8 12l3 3 5-5"/></svg>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M8 12l3 3 5-5"/></svg>
                 {:else}
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/></svg>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="2"><circle cx="12" cy="12" r="10"/></svg>
                 {/if}
               </span>
               <div class="q-row-info">
@@ -160,43 +160,40 @@
             </div>
             <div class="q-row-right">
               <div class="q-tags">
-                {#if (batch.done ?? 0) > 0}<span class="q-tag q-tag-done">{batch.done} done</span>{/if}
-                {#if (batch.pending ?? 0) > 0}<span class="q-tag q-tag-pending">{batch.pending} pending</span>{/if}
-                {#if (batch.errors ?? 0) > 0}<span class="q-tag q-tag-error">{batch.errors} errors</span>{/if}
+                {#if (batch.done ?? 0) > 0}<span class="chip chip-done">{batch.done} done</span>{/if}
+                {#if (batch.pending ?? 0) > 0}<span class="chip">{batch.pending} pending</span>{/if}
+                {#if (batch.errors ?? 0) > 0}<span class="chip chip-error">{batch.errors} errors</span>{/if}
               </div>
               <div class="q-row-btns">
                 {#if (batch.pending ?? 0) > 0}
-                  <button class="q-btn-sm q-btn-primary" onclick={() => processBatch(batch.batch_id)} disabled={processing}>PROCESS</button>
+                  <button class="q-btn-sm send-btn" onclick={() => processBatch(batch.batch_id)} disabled={processing}>Process</button>
                 {/if}
                 {#if (batch.errors ?? 0) > 0}
-                  <button class="q-btn-sm q-btn-error" onclick={() => toggleErrors(batch.batch_id)}>{expandedErrors[batch.batch_id] ? 'HIDE' : 'ERRORS'}</button>
+                  <button class="q-btn-sm btn-danger" onclick={() => toggleErrors(batch.batch_id)}>{expandedErrors[batch.batch_id] ? 'Hide' : 'Errors'}</button>
                 {/if}
-                <button class="q-btn-sm q-btn-outline" onclick={() => toggleExpand(batch.batch_id)}>{expandedBatch === batch.batch_id ? 'COLLAPSE' : 'EXPAND'}</button>
-                <button class="q-btn-sm q-btn-delete" onclick={() => deleteBatch(batch.batch_id)} title="Delete batch">&times;</button>
+                <button class="q-btn-sm btn-ghost" onclick={() => toggleExpand(batch.batch_id)}>{expandedBatch === batch.batch_id ? 'Collapse' : 'Expand'}</button>
+                <button class="q-btn-sm btn-ghost q-icon-btn" onclick={() => deleteBatch(batch.batch_id)} title="Delete batch" aria-label="delete">&times;</button>
               </div>
             </div>
           </div>
-          <!-- Progress bar -->
           <div class="q-progress"><div class="q-progress-fill" style="width:{pct}%"></div></div>
 
-          <!-- Error items -->
           {#if expandedErrors[batch.batch_id] && errorItems[batch.batch_id]?.length}
             <div class="q-errors">
               <div class="q-errors-head">
-                <span class="q-tag q-tag-error">FAILED</span>
-                <button class="q-btn-sm q-btn-error" onclick={() => retryAllErrors(batch.batch_id)} disabled={retrying}>RETRY ALL</button>
+                <span class="chip chip-error">Failed</span>
+                <button class="q-btn-sm btn-danger" onclick={() => retryAllErrors(batch.batch_id)} disabled={retrying}>Retry all</button>
               </div>
               {#each errorItems[batch.batch_id] as item}
                 <div class="q-error-row">
                   <span class="q-error-name">{item.file_name}</span>
                   <span class="q-error-msg">{item.error || 'Unknown'}</span>
-                  <button class="q-btn-sm q-btn-error" onclick={() => retryItem(item.id, batch.batch_id)} disabled={retrying}>RETRY</button>
+                  <button class="q-btn-sm btn-danger" onclick={() => retryItem(item.id, batch.batch_id)} disabled={retrying}>Retry</button>
                 </div>
               {/each}
             </div>
           {/if}
 
-          <!-- Expanded detail panel -->
           {#if expandedBatch === batch.batch_id}
             <div class="q-expand">
               {#if expandedData.length === 0}
@@ -211,14 +208,14 @@
                         alt={doc.source_file}
                         loading="lazy"
                         onload={(e) => { e.target.style.opacity = '1'; e.target.previousElementSibling.style.display = 'none'; }}
-                        onerror={(e) => { e.target.style.display = 'none'; e.target.previousElementSibling.style.background = '#ddd'; }}
+                        onerror={(e) => { e.target.style.display = 'none'; e.target.previousElementSibling.style.background = 'var(--surface-2)'; }}
                       />
                     </div>
                     <div class="q-doc-meta">
                       <div class="q-doc-top">
                         <span class="q-doc-filename">{doc.source_file}</span>
                         {#if doc.image_type}
-                          <span class="q-tag q-tag-type">{doc.image_type}</span>
+                          <span class="chip">{doc.image_type}</span>
                         {/if}
                       </div>
                       {#if doc.title}
@@ -256,12 +253,11 @@
     </div>
   {/if}
 
-  <!-- Compact terminal log -->
   {#if logs.length > 0}
-    <div class="q-terminal">
+    <div class="q-terminal card">
       <div class="q-terminal-head">
-        <span class="q-terminal-title">$ terminal</span>
-        <button class="q-terminal-clear" onclick={() => { logs = []; showTerminal = false; }}>CLEAR</button>
+        <span class="q-terminal-title">terminal</span>
+        <button class="q-terminal-clear" onclick={() => { logs = []; showTerminal = false; }}>Clear</button>
       </div>
       <div class="q-terminal-body">
         {#each logs.slice(-8) as line}
@@ -274,128 +270,87 @@
 </div>
 
 <style>
-  .q-page { width:100%; padding:16px; font-family:'Space Grotesk',sans-serif; }
+  .q-page { width:100%; padding:16px; font-family: var(--font-sans); max-width: 920px; margin: 0 auto; }
 
-  .q-header { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:20px; flex-wrap:wrap; }
-  .q-title-row { display:flex; flex-direction:column; gap:2px; }
-  .q-title-row h1 { margin:0; font-size:1.4rem; font-weight:900; letter-spacing:0.08em; }
-  .q-count { font-size:0.7rem; color:var(--color-on-surface-dim); letter-spacing:0.04em; text-transform:uppercase; }
-  .q-actions { display:flex; gap:6px; }
+  .q-header { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
+  .q-title-row { display:flex; flex-direction:column; gap:4px; }
+  .page-title { margin:0; font-size:24px; font-weight:600; color:var(--text); letter-spacing:0; }
+  .q-count { font-size:13px; color:var(--text-muted); }
+  .q-actions { display:flex; gap:8px; }
 
-  /* Buttons */
-  .q-btn { font-family:inherit; font-size:0.7rem; font-weight:700; padding:6px 14px; text-transform:uppercase; letter-spacing:0.06em; cursor:pointer; border:2px solid var(--color-on-surface); min-height:32px; }
-  .q-btn:disabled { opacity:0.4; cursor:not-allowed; }
-  .q-btn-primary { background:var(--color-on-surface); color:var(--color-surface); }
-  .q-btn-primary:hover:not(:disabled) { background:var(--color-primary); border-color:var(--color-primary); }
-  .q-btn-outline { background:none; color:var(--color-on-surface); }
-  .q-btn-outline:hover:not(:disabled) { background:var(--color-on-surface); color:var(--color-surface); }
+  .q-btn-sm { padding: 6px 12px; min-height: 30px; font-size: 12px; }
+  .q-icon-btn { font-size: 16px; padding: 6px 10px; }
 
-  .q-btn-sm { font-family:inherit; font-size:0.6rem; font-weight:700; padding:3px 10px; text-transform:uppercase; letter-spacing:0.06em; cursor:pointer; border:1.5px solid var(--color-on-surface); min-height:26px; background:none; color:var(--color-on-surface); }
-  .q-btn-sm:hover:not(:disabled) { background:var(--color-on-surface); color:var(--color-surface); }
-  .q-btn-sm:disabled { opacity:0.4; cursor:not-allowed; }
-  .q-btn-sm.q-btn-primary { background:var(--color-on-surface); color:var(--color-surface); }
-  .q-btn-sm.q-btn-error { border-color:#dc2626; color:#dc2626; }
-  .q-btn-sm.q-btn-error:hover:not(:disabled) { background:#dc2626; color:#fff; }
+  .q-list { display:flex; flex-direction:column; gap:10px; }
+  .q-row { padding:0; overflow:hidden; }
 
-  /* List */
-  .q-list { display:flex; flex-direction:column; gap:0; }
-  .q-row { border:2px solid var(--color-on-surface); border-bottom:none; padding:0; }
-  .q-row:last-child { border-bottom:2px solid var(--color-on-surface); }
-  .q-row:nth-child(even) { background:var(--color-surface-dim); }
-
-  .q-row-main { display:flex; justify-content:space-between; align-items:center; padding:12px 14px; gap:12px; }
-  .q-row-left { display:flex; align-items:center; gap:10px; min-width:0; }
+  .q-row-main { display:flex; justify-content:space-between; align-items:center; padding:14px 16px; gap:12px; }
+  .q-row-left { display:flex; align-items:center; gap:12px; min-width:0; }
   .q-row-icon { flex-shrink:0; width:20px; height:20px; display:flex; align-items:center; justify-content:center; }
-  .q-row-info { display:flex; flex-direction:column; gap:1px; min-width:0; }
-  .q-row-name { font-weight:700; font-size:0.85rem; font-family:'Space Grotesk',monospace; }
-  .q-row-detail { font-size:0.6rem; color:var(--color-on-surface-dim); text-transform:uppercase; letter-spacing:0.04em; }
+  .q-row-info { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .q-row-name { font-weight:600; font-size:14px; color:var(--text); font-family: var(--font-mono); }
+  .q-row-detail { font-size:12px; color:var(--text-muted); }
 
-  .q-row-right { display:flex; align-items:center; gap:8px; flex-shrink:0; }
-  .q-tags { display:flex; gap:4px; }
-  .q-row-btns { display:flex; gap:4px; }
+  .q-row-right { display:flex; align-items:center; gap:10px; flex-shrink:0; flex-wrap:wrap; }
+  .q-tags { display:flex; gap:4px; flex-wrap:wrap; }
+  .q-row-btns { display:flex; gap:6px; flex-wrap:wrap; }
 
-  /* Tags */
-  .q-tag { font-size:0.55rem; font-weight:900; letter-spacing:0.06em; text-transform:uppercase; padding:2px 6px; }
-  .q-tag-done { background:#dcfce7; color:#166534; }
-  .q-tag-pending { background:#fef9c3; color:#854d0e; }
-  .q-tag-error { background:#fee2e2; color:#991b1b; }
-  .q-tag-type { background:var(--color-surface-dim); color:var(--color-on-surface-dim); border:1px solid var(--color-on-surface); }
+  .chip-done { background: rgba(90,143,61,0.15); color: var(--success); }
+  .chip-error { background: rgba(181,69,61,0.12); color: var(--danger); }
 
-  /* Progress */
-  .q-progress { height:3px; background:var(--color-surface-dim); }
-  .q-progress-fill { height:100%; background:var(--color-primary); transition:width 0.4s ease; }
+  .q-progress { height:3px; background:var(--surface-2); }
+  .q-progress-fill { height:100%; background:var(--accent); transition:width 0.4s ease; }
 
-  /* Spinner */
-  .q-spinner { width:14px; height:14px; border:2px solid rgba(0,0,0,0.1); border-top-color:var(--color-primary); border-radius:50% !important; animation:qspin 0.7s linear infinite; display:block; }
+  .q-spinner { width:14px; height:14px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:qspin 0.7s linear infinite; display:block; }
   @keyframes qspin { to { transform:rotate(360deg); } }
 
-  /* Errors */
-  .q-errors { padding:8px 14px; background:#fef2f2; border-top:1px dashed rgba(0,0,0,0.1); }
-  .q-errors-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
-  .q-error-row { display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid rgba(0,0,0,0.06); font-size:0.75rem; }
-  .q-error-name { font-family:monospace; font-weight:700; font-size:0.7rem; min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .q-error-msg { font-size:0.6rem; color:#991b1b; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; word-break:break-word; max-width:100%; }
-  @media (max-width:640px) { .q-error-msg { white-space:normal; max-width:calc(100vw - 120px); } .q-error-row { flex-wrap:wrap; } }
+  .q-errors { padding:10px 16px; background:rgba(181,69,61,0.05); border-top:1px solid var(--border); }
+  .q-errors-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+  .q-error-row { display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid var(--border); font-size:12px; }
+  .q-error-row:last-child { border-bottom: none; }
+  .q-error-name { font-family:var(--font-mono); font-weight:500; font-size:12px; min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .q-error-msg { font-size:11px; color:var(--danger); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; word-break:break-word; }
+  @media (max-width:640px) { .q-error-msg { white-space:normal; } .q-error-row { flex-wrap:wrap; } }
 
-  /* Expanded detail panel */
-  .q-expand { border-top:2px dashed var(--color-on-surface); padding:12px 14px; background:var(--color-surface); }
-  .q-expand-empty { font-size:0.75rem; color:var(--color-on-surface-dim); text-transform:uppercase; letter-spacing:0.04em; padding:8px 0; }
+  .q-expand { border-top:1px solid var(--border); padding:14px 16px; background:var(--surface-2); }
+  .q-expand-empty { font-size:13px; color:var(--text-muted); padding:8px 0; }
 
-  .q-doc-row { display:flex; gap:12px; align-items:flex-start; padding:8px 0; }
-  .q-doc-thumb { flex-shrink:0; width:60px; height:60px; overflow:hidden; border:1.5px solid var(--color-on-surface); position:relative; }
+  .q-doc-row { display:flex; gap:12px; align-items:flex-start; padding:10px 0; }
+  .q-doc-thumb { flex-shrink:0; width:56px; height:56px; overflow:hidden; border:1px solid var(--border); border-radius: var(--r-sm); position:relative; }
   .q-doc-thumb img { width:100%; height:100%; object-fit:cover; display:block; opacity:0; transition:opacity 0.2s; position:relative; z-index:1; }
-  .q-thumb-skeleton { position:absolute; inset:0; background:var(--color-surface-dim); animation:q-pulse 1.2s ease-in-out infinite; z-index:0; }
+  .q-thumb-skeleton { position:absolute; inset:0; background:var(--surface-2); animation:q-pulse 1.2s ease-in-out infinite; z-index:0; }
   @keyframes q-pulse { 0%,100% { opacity:0.4; } 50% { opacity:1; } }
 
-  .q-doc-meta { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+  .q-doc-meta { flex:1; min-width:0; display:flex; flex-direction:column; gap:3px; }
   .q-doc-top { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
-  .q-doc-filename { font-family:'Space Grotesk',monospace; font-weight:700; font-size:0.75rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .q-doc-title { font-size:0.7rem; color:var(--color-on-surface); font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .q-doc-products { font-size:0.65rem; color:var(--color-on-surface-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .q-doc-more { font-weight:700; color:var(--color-primary); margin-left:4px; }
-  .q-doc-company { font-size:0.65rem; color:var(--color-on-surface-dim); text-transform:uppercase; letter-spacing:0.04em; font-weight:700; }
-  .q-doc-contact { font-size:0.6rem; color:var(--color-on-surface-dim); font-family:'Space Grotesk',monospace; }
+  .q-doc-filename { font-family:var(--font-mono); font-weight:500; font-size:13px; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .q-doc-title { font-size:13px; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .q-doc-products { font-size:12px; color:var(--text-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .q-doc-more { color:var(--accent); margin-left:4px; }
+  .q-doc-company { font-size:12px; color:var(--text-muted); font-weight:500; }
+  .q-doc-contact { font-size:11px; color:var(--text-faint); font-family:var(--font-mono); }
 
-  .q-doc-sep { border-bottom:1px dashed var(--color-on-surface); opacity:0.2; margin:0; }
+  .q-doc-sep { border-bottom:1px solid var(--border); margin:0; }
 
-  /* Terminal -- compact, not fullscreen */
-  .q-terminal { margin-top:16px; border:2px solid var(--color-on-surface); }
-  .q-terminal-head { display:flex; justify-content:space-between; align-items:center; padding:6px 12px; background:var(--color-on-surface); color:var(--color-surface); }
-  .q-terminal-title { font-size:0.65rem; font-weight:900; letter-spacing:0.08em; font-family:'Space Grotesk',monospace; }
-  .q-terminal-clear { background:none; border:none; color:rgba(255,255,255,0.5); font-family:inherit; font-size:0.6rem; cursor:pointer; text-transform:uppercase; min-height:20px; }
-  .q-terminal-clear:hover { color:#fff; }
-  .q-terminal-body { background:#1a1a1a; color:#00fc40; font-family:'Space Grotesk',monospace; font-size:0.7rem; line-height:1.6; padding:8px 12px; max-height:140px; overflow-y:auto; }
-  .q-terminal-line { white-space:pre-wrap; }
-  .q-blink { animation:qblink 1s step-end infinite; }
+  .q-terminal { margin-top:16px; padding: 0; overflow: hidden; }
+  .q-terminal-head { display:flex; justify-content:space-between; align-items:center; padding:8px 14px; background:var(--surface-2); border-bottom: 1px solid var(--border); }
+  .q-terminal-title { font-size:12px; font-weight:500; color:var(--text-muted); font-family:var(--font-mono); }
+  .q-terminal-clear { background:none; border:none; color:var(--text-muted); font-family:inherit; font-size:12px; cursor:pointer; }
+  .q-terminal-clear:hover { color:var(--text); }
+  .q-terminal-body { background:var(--surface-2); color:var(--text); font-family:var(--font-mono); font-size:12px; line-height:1.6; padding:10px 14px; max-height:160px; overflow-y:auto; }
+  .q-terminal-line { white-space:pre-wrap; color: var(--text-muted); }
+  .q-blink { animation:qblink 1s step-end infinite; color: var(--accent); }
   @keyframes qblink { 50% { opacity:0; } }
 
-  /* Toast */
-  .q-toast { position:fixed; top:16px; left:50%; transform:translateX(-50%); background:#16a34a; color:#fff; padding:10px 24px; font-size:0.8rem; font-weight:700; letter-spacing:0.04em; z-index:9999; box-shadow:0 4px 12px rgba(0,0,0,0.2); animation:q-toast-in 0.3s ease-out; }
-  @keyframes q-toast-in { from { opacity:0; transform:translateX(-50%) translateY(-12px); } to { opacity:1; transform:translateX(-50%) translateY(0); } }
+  .q-toast { position:fixed; bottom:24px; right:24px; background:var(--accent); color:#fff; padding:10px 16px; font-size:13px; font-weight:500; z-index:9999; border-radius:var(--r-md); box-shadow:var(--shadow-md); animation:q-toast-in 0.25s ease-out; }
+  @keyframes q-toast-in { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
 
-  /* Delete button */
-  .q-btn-sm.q-btn-delete { border-color:#dc2626; color:#dc2626; font-size:0.85rem; font-weight:900; padding:3px 8px; line-height:1; }
-  .q-btn-sm.q-btn-delete:hover:not(:disabled) { background:#dc2626; color:#fff; }
+  .q-empty { display:flex; flex-direction:column; align-items:center; gap:12px; padding:48px 16px; text-align:center; color:var(--text-muted); }
 
-  /* Empty */
-  .q-empty { display:flex; flex-direction:column; align-items:center; gap:12px; padding:48px 16px; text-align:center; color:var(--color-on-surface-dim); }
-
-  /* Responsive: tablet */
-  @media (max-width:900px) {
-    .q-doc-thumb { width:50px; height:50px; }
-    .q-doc-title { max-width:260px; }
-    .q-doc-products { max-width:260px; }
-  }
-
-  /* Responsive: mobile */
   @media (max-width:640px) {
-    .q-row-main { flex-direction:column; align-items:stretch; gap:8px; }
-    .q-row-right { flex-wrap:wrap; }
-    .q-tags { flex-wrap:wrap; }
-
+    .q-row-main { flex-direction:column; align-items:stretch; gap:10px; }
+    .q-row-right { flex-wrap:wrap; justify-content: space-between; }
     .q-doc-row { flex-direction:column; gap:6px; }
-    .q-doc-thumb { width:40px; height:40px; }
-    .q-doc-title { max-width:100%; }
-    .q-doc-products { max-width:100%; white-space:normal; }
+    .q-doc-thumb { width:48px; height:48px; }
   }
 </style>

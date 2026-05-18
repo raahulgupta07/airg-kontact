@@ -7,6 +7,8 @@ a pre-built summary.
 import sqlite3
 import json
 import os
+import re
+import httpx
 import config
 
 DB_PATH = os.path.join(config.DATA_DIR, "kontact.db")
@@ -60,12 +62,20 @@ _BLOCKED_KEYWORDS = {"INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE",
                      "REPLACE", "ATTACH", "DETACH", "VACUUM", "REINDEX",
                      "PRAGMA"}
 
+# Strict UUID v4 pattern: 8-4-4-4-12 hex with version/variant nibble checks loosened
+UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 
-def query_catalog_db(sql: str) -> str:
+_TENANCY_TABLES = ("documents", "contacts", "products")
+
+
+def query_catalog_db(sql: str, user: dict = None) -> str:
     """
     Execute a read-only SQL query against kontact.db and return the results
     as a markdown table.  Max 50 rows.  Only SELECT / WITH statements are
     permitted.
+
+    Tenancy: non-admin users get bare references to documents/contacts/products
+    rewritten to user-scoped TEMP VIEWs that strictly pre-filter by owner_uuid.
     """
     sql = sql.strip().rstrip(";")
 
@@ -76,7 +86,6 @@ def query_catalog_db(sql: str) -> str:
 
     upper_sql = sql.upper()
     for kw in _BLOCKED_KEYWORDS:
-        # Check for the keyword as a whole word
         if f" {kw} " in f" {upper_sql} " or upper_sql.startswith(kw):
             return f"Error: `{kw}` statements are not allowed (read-only mode)."
 
@@ -86,6 +95,31 @@ def query_catalog_db(sql: str) -> str:
 
     conn = _conn()
     try:
+        # Tenancy view rewrite for non-admin
+        if user and user.get("role") not in ("super_admin", "admin"):
+            uid = (user.get("uuid") or "").lower()
+            # Defence in depth: regex + strict parse via uuid.UUID
+            if not UUID_RE.match(uid):
+                return "Error: invalid session"
+            try:
+                import uuid as _uuid
+                _uuid.UUID(uid)
+            except Exception:
+                return "Error: invalid session"
+            for t in _TENANCY_TABLES:
+                try:
+                    conn.execute(f"DROP VIEW IF EXISTS user_{t}")
+                    # uid is now a validated UUID — no injection vector
+                    conn.execute(
+                        f"CREATE TEMP VIEW user_{t} AS "
+                        f"SELECT * FROM {t} WHERE owner_uuid = '{uid}'"
+                    )
+                except Exception:
+                    pass
+            # rewrite bare table names → view names (word-boundary, case-insensitive)
+            for t in _TENANCY_TABLES:
+                sql = re.sub(rf'\b{t}\b', f'user_{t}', sql, flags=re.IGNORECASE)
+
         cursor = conn.execute(sql)
         rows = cursor.fetchall()
         if not rows:
@@ -332,19 +366,249 @@ def get_catalog_summary() -> str:
 # Tool dispatcher (for agent integration)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tool 4 — open_messenger
+# ---------------------------------------------------------------------------
+
+_SUPPORTED_PLATFORMS = {
+    "whatsapp", "viber", "telegram", "line", "signal", "wechat", "zalo",
+}
+
+
+def _strip_plus(num: str) -> str:
+    return re.sub(r"[^\d]", "", num or "")
+
+
+def open_messenger(contact_uuid: str, platform: str) -> str:
+    """
+    Build a clickable deeplink for the given contact + platform.
+    Returns the URL plus a markdown render.
+    """
+    platform = (platform or "").strip().lower()
+    if platform not in _SUPPORTED_PLATFORMS:
+        return (
+            f"Error: Unsupported platform `{platform}`. "
+            f"Choose one of: {', '.join(sorted(_SUPPORTED_PLATFORMS))}."
+        )
+
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM contacts WHERE uuid = ?", (contact_uuid,)
+        ).fetchone()
+        if not row:
+            return f"Error: Contact `{contact_uuid}` not found."
+
+        keys = row.keys()
+
+        def field(name: str):
+            return row[name] if name in keys else None
+
+        company = field("company") or ""
+        person = field("person") or ""
+        label = f"{person or company} ({platform})".strip()
+
+        link = None
+        if platform == "whatsapp":
+            val = field("whatsapp") or field("phone_e164") or field("phone")
+            if not val:
+                return "Error: whatsapp not stored for this contact."
+            link = f"https://wa.me/{_strip_plus(val)}"
+        elif platform == "telegram":
+            val = field("telegram")
+            if not val:
+                return "Error: telegram not stored for this contact."
+            v = val.lstrip("@")
+            link = f"https://t.me/{v}"
+        elif platform == "line":
+            val = field("line_id") or field("line")
+            if not val:
+                return "Error: line not stored for this contact."
+            link = f"https://line.me/ti/p/~{val}"
+        elif platform == "wechat":
+            val = field("wechat_qr_url")
+            if not val:
+                wid = field("wechat_id")
+                if wid:
+                    return (
+                        f"WeChat ID: `{wid}` (no QR stored — add in WeChat: "
+                        f"Add Friend → Search by WeChat ID)\n\n"
+                        f"**Contact:** {label}"
+                    )
+                return "Error: wechat not stored for this contact."
+            link = val
+        elif platform == "viber":
+            val = field("phone_e164") or field("phone")
+            if not val:
+                return "Error: viber not stored for this contact."
+            link = f"viber://add?number={_strip_plus(val)}"
+        elif platform == "signal":
+            val = field("signal_phone") or field("phone_e164") or field("phone")
+            if not val:
+                return "Error: signal not stored for this contact."
+            link = f"https://signal.me/#p/+{_strip_plus(val)}"
+        elif platform == "zalo":
+            val = field("phone_e164") or field("phone")
+            if not val:
+                return "Error: zalo not stored for this contact."
+            link = f"https://zalo.me/{_strip_plus(val)}"
+
+        return (
+            f"**Open {platform} for {label}**\n\n"
+            f"[{link}]({link})\n\n"
+            f"`{link}`"
+        )
+
+    except Exception as e:
+        return f"Error: {e}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool 5 — fetch_catalog_url
+# ---------------------------------------------------------------------------
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+
+def fetch_catalog_url(url: str) -> str:
+    """
+    GET a URL with a browser UA. Returns content-type, size, and first
+    2000 chars of stripped text (PDFs return metadata only). Read-only.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return "Error: URL must start with http:// or https://"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        ),
+    }
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30) as client:
+            r = client.get(url, headers=headers)
+            ctype = r.headers.get("content-type", "unknown")
+            size = len(r.content)
+            lines = [
+                f"**URL:** {url}",
+                f"**Status:** {r.status_code}",
+                f"**Content-Type:** {ctype}",
+                f"**Size:** {size:,} bytes",
+            ]
+            if "pdf" in ctype.lower() or url.lower().endswith(".pdf"):
+                lines.append("\n_(PDF — metadata only, body not extracted.)_")
+                return "\n".join(lines)
+
+            try:
+                text = r.text
+            except Exception:
+                return "\n".join(lines) + "\n\n_(Binary body, not text.)_"
+
+            stripped = _HTML_TAG_RE.sub(" ", text)
+            stripped = _WS_RE.sub(" ", stripped).strip()
+            lines.append("\n**Preview (first 2000 chars):**\n")
+            lines.append(stripped[:2000])
+            return "\n".join(lines)
+    except httpx.TimeoutException:
+        return f"Error: Timeout fetching {url}"
+    except Exception as e:
+        return f"Error fetching URL: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Tool 6 — find_unmapped_wechat_chats
+# ---------------------------------------------------------------------------
+
+def find_unmapped_wechat_chats() -> str:
+    """List wechat_chat_map rows with no vendor_company assigned."""
+    conn = _conn()
+    try:
+        try:
+            cursor = conn.execute(
+                "SELECT * FROM wechat_chat_map WHERE vendor_company IS NULL"
+            )
+        except sqlite3.OperationalError as e:
+            return f"Error: {e} (is `wechat_chat_map` table present?)"
+        rows = cursor.fetchall()
+        if not rows:
+            return "_All WeChat chats are mapped to a vendor._"
+        columns = [d[0] for d in cursor.description]
+        return _rows_to_markdown(rows, columns)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool 7 — list_messenger_contacts
+# ---------------------------------------------------------------------------
+
+_PLATFORM_COLUMN = {
+    "whatsapp": "whatsapp",
+    "viber": "phone_e164",   # viber keyed off phone_e164
+    "telegram": "telegram",
+    "line": "line_id",
+    "wechat": "wechat_id",
+    "signal": "signal_phone",
+    "zalo": "phone_e164",
+}
+
+
+def list_messenger_contacts(platform: str) -> str:
+    """List contacts that have a stored handle for the given platform."""
+    platform = (platform or "").strip().lower()
+    col = _PLATFORM_COLUMN.get(platform)
+    if not col:
+        return (
+            f"Error: Unsupported platform `{platform}`. "
+            f"Choose one of: {', '.join(sorted(_PLATFORM_COLUMN))}."
+        )
+    conn = _conn()
+    try:
+        try:
+            cursor = conn.execute(
+                f"SELECT company, person, {col} FROM contacts "
+                f"WHERE {col} IS NOT NULL AND {col} != '' "
+                f"ORDER BY company LIMIT 200"
+            )
+        except sqlite3.OperationalError as e:
+            return f"Error: {e} (is column `{col}` present on contacts?)"
+        rows = cursor.fetchall()
+        if not rows:
+            return f"_No contacts with `{platform}` ({col}) stored._"
+        columns = [d[0] for d in cursor.description]
+        return _rows_to_markdown(rows, columns)
+    finally:
+        conn.close()
+
+
 TOOLS = {
     "query_catalog_db": query_catalog_db,
     "introspect_schema": introspect_schema,
     "get_catalog_summary": get_catalog_summary,
+    "open_messenger": open_messenger,
+    "fetch_catalog_url": fetch_catalog_url,
+    "find_unmapped_wechat_chats": find_unmapped_wechat_chats,
+    "list_messenger_contacts": list_messenger_contacts,
 }
 
 
-def execute_tool(name: str, args: dict) -> str:
-    """Dispatch a tool call by name. Returns a string result."""
+def execute_tool(name: str, args: dict, user: dict = None) -> str:
+    """Dispatch a tool call by name. Returns a string result.
+
+    `user` is forwarded to tools that accept a `user` kwarg (e.g. query_catalog_db)
+    so tenancy can be enforced.
+    """
     fn = TOOLS.get(name)
     if not fn:
         return f"Error: Unknown tool `{name}`."
     try:
+        # Inject user into tools that accept it
+        if name == "query_catalog_db":
+            return fn(user=user, **args)
         return fn(**args)
     except Exception as e:
         return f"Error executing {name}: {e}"

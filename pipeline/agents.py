@@ -8,6 +8,7 @@ Types:
 - company_profile: about the company, factory, history, certifications
 - cover: front/back cover of a brochure or catalog
 - contact_page: contact info, addresses, phone numbers, QR codes
+- qr_card: business card or small panel dominated by one or more QR codes (WeChat, LINE, WhatsApp) with adjacent printed handles, IDs, names, or phone numbers
 - tech_diagram: architecture diagrams, system layouts, flowcharts
 - section_divider: chapter/section title page with minimal content
 - price_list: tables of prices, rates, fees
@@ -110,6 +111,30 @@ Return JSON:
   "currency": "currency if shown",
   "raw_text": "all text on the image exactly as shown"
 }""",
+
+    "qr_card": """This image contains one or more QR codes with printed contact info NEAR each code.
+Carefully read every label adjacent to a QR code: WeChat ID (`微信号:` / `WeChat:` / `WeChat ID:`),
+LINE ID (`LINE ID:` / `LINE:`), WhatsApp number (`WhatsApp:` / `WA:`), Viber, Telegram, KakaoTalk ID,
+person name, company name, job title, phone, email, website.
+
+Return JSON:
+{
+  "company": "company name or null",
+  "title": "card/page title or null",
+  "contact": {
+    "person": "name printed on the card or null",
+    "phone": "primary phone number or null",
+    "email": "email or null",
+    "wechat_id": "WeChat ID printed near QR (after 微信号 / WeChat) or null",
+    "line_id": "LINE ID printed near QR or null",
+    "whatsapp": "WhatsApp number printed near QR or null",
+    "website": "website URL or null",
+    "address": "address or null"
+  },
+  "key_info": ["other handles, IDs, booth numbers, taglines"],
+  "raw_text": "all text on the image exactly as shown"
+}
+Read ONLY printed text — do NOT invent IDs from the QR pattern. Preserve original casing of handles.""",
 
     "other": """Extract all information visible in this image.
 Return JSON:

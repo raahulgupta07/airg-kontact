@@ -1,241 +1,243 @@
 # KONTACT — Catalog Vision RAG Agent
 
-Snap photos of product catalogs at trade shows, extract structured data with AI vision agents, and chat with an intelligent agent that runs SQL queries, remembers facts, cites sources with images, and knows who you met.
+Snap photos of product catalogs at trade shows, scan QR codes (vCard, WhatsApp, WeChat, URL), extract structured data with multi-agent AI vision, and chat with an intelligent agent that runs SQL queries, remembers facts, cites sources with images, and knows who you met.
+
+**Multi-tenant, hardened, production-shape.**
 
 ## What it does
 
-1. **Upload** — Take photos of catalog pages (phone camera, PDF, drag-drop) with EXIF metadata extraction (GPS, camera, date)
-2. **Extract** — 8 specialized AI agents classify and extract products, contacts, specs, prices, diagrams
-3. **Normalize** — Products and contacts stored in separate queryable tables with UUIDs
-4. **Chat** — Intelligent agent with SQL tools, memory, streaming, and image citations
-5. **Browse** — Data tables with filters, sort, search, metadata, and Excel export
+1. **Upload** — Phone camera, file picker, PDF, drag-drop. Browser geolocation + client EXIF fallback for stripped images.
+2. **Classify + Extract** — 8 specialized AI agents route + extract products, contacts, specs, prices, QR payloads.
+3. **Enrich** —
+   - EXIF: GPS, camera, lens, ISO, exposure, software, sub-second time
+   - Reverse geocode → country, city, address
+   - Perceptual hash + blur detection (blurry images skip LLM)
+   - QR decode: vCard, WhatsApp, WeChat, Viber, Telegram, Line, Signal, URL
+   - **URL QR resolver**: fetch landing page, parse JSON-LD + OG + microdata → person/company/phone/email
+4. **Normalize** — Products, contacts, companies, messengers in queryable tables with UUIDs.
+5. **Chat** — Agent with SQL tools, per-user history, streaming SSE, image citations, retry-on-429.
+6. **Browse** — 20-tab UI (Catalog / Insights / Workspace): tables, gallery, Leaflet map, timeline, dedup clusters, exports.
 
-## Quick Start
+## Quick start
 
 ```bash
-# Docker (recommended)
-cp .env.example .env        # Add your OPENROUTER_API_KEY
-./deploy.sh                 # Build + start
-# Open http://localhost:8000
-
-# Manual
-pip3 install -r requirements.txt
-pip3 install chromadb sentence-transformers openpyxl
-cd frontend && npm install && npm run build && cd ..
-python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
+cp .env.example .env
+# Edit .env: set OPENROUTER_API_KEY, SUPER_ADMIN_PASSWORD, SESSION_SECRET
+docker compose up -d --build kontact
+# http://localhost:8090
 ```
+
+Default super-admin login bootstraps from `.env`. Create more users from `/users`.
+
+## Production deploy
+
+```bash
+# In .env
+COOKIE_SECURE=true
+CORS_ORIGINS=https://kontact.yourdomain.com
+DOMAIN=kontact.yourdomain.com
+SUPER_ADMIN_PASSWORD=<rotate>
+SESSION_SECRET=$(python3 -c 'import secrets;print(secrets.token_urlsafe(48))')
+
+# Caddy + Let's Encrypt
+docker compose --profile https up -d
+```
+
+## Auth
+
+| Identifier | Secret |
+|------------|--------|
+| email | password |
+| email | PIN |
+| phone (E.164 or `+86xxxxxxxxx`) | password |
+| phone | PIN |
+
+Session = HttpOnly cookie, 14-day, signed (itsdangerous), HTTPS-secure when `COOKIE_SECURE=true`.
+
+5 fails in 15 min → 30-min lockout. Rate limits: 10/min login, 30/min upload, 60/min chat.
 
 ## Architecture
 
 ```
-Phone Camera (with GPS/EXIF)
-    │
-    ▼
-Upload → Queue (auto-process in background)
-    │
-    ▼
-Classifier Agent → "product_page" / "contact_page" / "tech_diagram" / ...
-    │
-    ▼
-Specialized Agent → Structured JSON
-    │
-    ▼
-Normalize → documents + products + contacts tables (with UUIDs)
-    │
-    ▼
-Index → SQLite FTS5 + ChromaDB vectors
-    │
-    ▼
-Chat Agent ← RAG context + SQL tools + memory + feedback
-    │
-    ▼
-Streaming Answer + Image Citations + Follow-up Suggestions
+Phone Camera / File Picker / PDF / Sync Watcher
+        ↓
+Upload (MIME + size + PIL bomb guards + safe filename)
+        ↓
+Queue (SQLite, owner_uuid per row)
+        ↓
+Loader: EXIF + QR + phash + blur
+        ↓
+Extractor:
+    is_blurry? → skip LLM, mark blurry
+    else → Classifier (Gemini 3.1 Flash Lite) → Specialized agent
+                ↓
+        Merge QR + url_resolver enrichment for URL-type QRs
+        ↓
+Insert: documents + products + contacts + messengers + audit
+        ↓
+Index: ChromaDB (vector) + FTS5 (lexical) + audit_events
+        ↓
+Agent: SQL tool loop + memory + streaming SSE
 ```
 
-## Agent Capabilities
+## Database (12 tables)
 
-The chat agent is more than a simple RAG — it has **SQL tools** and **memory**:
+| Table | Purpose |
+|-------|---------|
+| `users` | accounts, roles, last_login |
+| `documents` | catalog pages, 50+ columns (EXIF, geo, quality, audit) |
+| `products` | normalized one-per-row |
+| `contacts` | normalized one-per-row, messenger columns |
+| `documents_fts` | FTS5 virtual table |
+| `queue` | upload queue, owner_uuid |
+| `chat_history` | per-session, scoped by user_uuid |
+| `login_attempts` | throttle log |
+| `audit_events` | upload/login/edit/delete/share/merge |
+| `tags`, `document_tags`, `notes`, `meetings`, `events` | workspace CRUD |
 
-```
-User: "Who did I meet at the trade show?"
-Agent: [TOOL: query_catalog_db] SELECT company, person, phone, email FROM contacts
-→ Returns full contact table with Shirley (+86-15268367084), Dahua Technology, etc.
+`PRAGMA foreign_keys=ON`. WAL mode. 30s busy_timeout.
 
-User: "How many data strip products?"
-Agent: [TOOL: query_catalog_db] SELECT COUNT(*) FROM products WHERE category = 'data strips'
-→ "There are 24 data strip products"
-
-User: "Where was this catalog photographed?"
-Agent: [TOOL: query_catalog_db] SELECT folder, gps_lat, gps_lng FROM documents WHERE gps_lat IS NOT NULL
-→ Shows GPS coordinates from phone camera EXIF data
-```
-
-| Capability | How |
-|-----------|-----|
-| Count & aggregate | SQL: `SELECT COUNT(*), category FROM products GROUP BY category` |
-| Filter & compare | SQL: `SELECT * FROM products WHERE company = 'Ahua'` |
-| Find contacts | SQL: `SELECT company, person, phone, email FROM contacts` |
-| Search products | RAG: semantic + keyword search across all catalogs |
-| Remember facts | Memory: saves/recalls facts across sessions |
-| Learn from feedback | Thumbs up/down improves future responses |
-| Cite sources | Image citations with clickable thumbnails |
-| Know locations | EXIF: GPS coordinates from phone photos |
-
-## Database Schema
+## Endpoints (40+)
 
 ```
-documents (36 rows)              products (131 rows)              contacts (6 rows)
-├── uuid                         ├── uuid                         ├── uuid
-├── folder                       ├── document_uuid ──FK──►        ├── document_uuid ──FK──►
-├── source_file                  ├── company                      ├── company
-├── image_type                   ├── name                         ├── person
-├── company                      ├── model                        ├── phone
-├── title                        ├── specs                        ├── email
-├── gps_lat / gps_lng            ├── category                     ├── website
-├── date_taken                   ├── price                        ├── address
-├── camera_make / camera_model   ├── image_desc                   └── created_at
-├── img_width / img_height       └── created_at
-├── file_size_kb
-└── created_at
+/api/auth/{login,logout,me}
+/api/users {GET POST PATCH DELETE}
+/api/upload {POST}
+/api/queue/batches /api/queue/retry/{id} /api/batch/{id} {DELETE}
+/api/chat {POST}      /api/chat/stream {SSE}     /api/chat/sessions
+/api/data /api/products /api/contacts /api/dashboard /api/search /api/search/semantic
+/api/aggregations/{locations,countries,timeline,cameras,messengers,
+                   qr-codes,quality,duplicates,sync-sources,pricing,map-points}
+/api/tags /api/notes /api/meetings /api/events {CRUD}
+/api/image/{folder}/{file}   ← realpath-checked, owner-scoped
+/api/export/{xlsx,csv,json}
+/api/feedback /api/memories
+/health
 ```
 
-## 8 Extraction Agents
+## Security
 
-| Agent | What it extracts |
-|-------|-----------------|
-| Product Page | Product names, models, specs, categories, prices, image descriptions |
-| Company Profile | Description, factory details, certifications, services |
-| Cover | Company name, taglines, trade show info |
-| Contact Page | Person, phone, email, website, addresses, global offices |
-| Tech Diagram | Systems, zones, architecture, features |
-| Section Divider | Section titles and numbers |
-| Price List | Items with prices, units, currency |
-| Other | General text and key info |
+| Layer | Control |
+|-------|---------|
+| Secrets | `SESSION_SECRET` ≥32 chars, fails startup if placeholder. Live API key/admin password never in repo (`.env` gitignored). |
+| CORS | env-driven origins, no wildcard with credentials |
+| Auth | bcrypt 4.0.1 (passlib pinned), HttpOnly cookies, JWT-style timed token |
+| Privacy | `visibility_clause()` filters `owner_uuid` on every query; chat history `user_uuid` strict; TEMP VIEW rewriter for chat SQL tool |
+| Input | UUID strict-parse before SQL, MIME allowlist, 100MB size cap, PIL 100MP pixel cap, PDF 200-page cap |
+| Network | SSRF guard in url_resolver (blocks private IPs, `.local`, loopback) |
+| Path | image serve uses `realpath` + `_safe_under(UPLOADS_DIR)` |
+| Rate | slowapi per-route |
+| DB | FK ON, busy_timeout, WAL, `INSERT OR REPLACE` removed for FK safety |
+| LLM | OpenRouter 3× retry on 429/5xx |
+| Storage | ChromaDB daily prune + cascade delete on batch removal |
 
-## UI Features
+## EXIF + browser geo
 
-**Chat Agent**
-- Streaming SSE with RAG ANALYZING animation
-- CLI execution bar with tool steps + checkmarks
-- Image citations (clickable thumbnails with lightbox)
-- Thumbs up/down feedback (connected to memory)
-- Voice input (Web Speech API)
-- Export conversation as markdown
-- Session history with search
-- Follow-up suggestion chips
-- 60s stream timeout protection
+`pipeline/loader.py:extract_exif` reads via PIL `getexif().get_ifd()`:
+- GPS lat/lng/altitude/heading/speed (with unit conversion)
+- DateTimeOriginal + sub-second
+- Camera make/model, lens model, focal length, f-number, ISO, exposure time
+- Orientation, dimensions, file size
 
-**Data Browser**
-- Filter by folder + image type, sort by date/type/company
-- Expandable cards with thumbnail, products, contacts, metadata
-- Metadata tags: dimensions, file size, UUID, GPS, camera, date taken
-- Copy/Save JSON per document
+Client-side fallback in `upload/+page.svelte`:
+- `exifr@7.1.3` reads EXIF before browser strips it
+- `navigator.geolocation` (8s timeout)
+- `DeviceOrientationEvent` (iOS heading)
+- Battery API + device signals JSON
 
-**Queue Manager**
-- Inline expand with document thumbnails
-- Retry/delete failed items, toast notifications
-- Processing progress with terminal log
+Server merges in priority: EXIF > client EXIF sidecar > browser geo.
 
-**More Page**
-- Products table (131 rows, searchable, XLSX export)
-- Contacts table (6 rows, searchable)
-- Companies table (14 with doc/product counts)
-- Categories breakdown (28 categories)
-- Product specs table (85 with specs)
-- Image gallery (36 thumbnails)
-- Documents table (UUID, dimensions, file size, GPS, dates)
+## QR support matrix
 
-**Upload**
-- Camera + drag-drop + PDF upload (auto-splits pages)
-- Real upload progress bar
-- Image quality warnings
-- HEIC/HEIF/AVIF/TIFF/JFIF support
+| Type | Outcome |
+|------|---------|
+| vCard | full contact extracted (name, org, phone, email) |
+| WhatsApp `wa.me/<E164>` | phone normalized → E.164 |
+| WhatsApp `wa.me/qr/<code>` | invite_code + deeplink (phone NOT in URL — by design) |
+| WeChat URL | `wechat_qr_url` column |
+| Viber/Telegram/Line/Signal | parsed handle/phone |
+| URL | **fetch landing → parse → person/phone/email/company** |
+| Email/Phone/SMS | direct extract |
+| WiFi | SSID + auth captured |
 
-## API Endpoints (25+)
+## URL profile resolver
 
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /api/upload` | Upload images/PDFs (auto-processes) |
-| `POST /api/chat/stream` | Streaming chat with SQL tools (SSE) |
-| `POST /api/chat` | Non-streaming chat |
-| `GET /api/products` | All products (normalized table) |
-| `GET /api/contacts` | All contacts (normalized table) |
-| `GET /api/dashboard` | Stats + breakdowns |
-| `GET /api/documents/metadata` | Documents with EXIF metadata |
-| `GET /api/search?q=` | Full-text search |
-| `GET /api/search/semantic?q=` | Semantic vector search |
-| `GET /api/data` | All extracted documents |
-| `GET /api/queue/batches` | Queue management |
-| `POST /api/queue/retry/{id}` | Retry failed extraction |
-| `DELETE /api/batch/{id}` | Delete batch |
-| `GET /api/export/xlsx` | Excel export (3 sheets) |
-| `GET /api/export/json` | JSON export |
-| `GET /api/export/csv` | CSV export |
-| `POST /api/feedback` | Save thumbs up/down |
-| `GET /api/memories` | Agent memories |
-| `POST /api/migrate` | Run table normalization |
-| `GET /api/image/{folder}/{file}` | Serve catalog images |
-| `GET /api/config` | Model configuration |
-| `GET /health` | Health check (Docker) |
+`pipeline/url_resolver.py` — when a QR encodes a plain URL:
+- SSRF guard (block private/loopback/link-local)
+- httpx GET, 8s timeout, 2MB cap, 4 redirects
+- Parse: JSON-LD Person/Organization/LocalBusiness → name/phone/email/address/jobTitle/sameAs
+- Fallback: OG meta (title, site_name), `mailto:`/`tel:` links, regex on text
+- Phone → E.164 via phonenumbers
 
-## Tech Stack
+Tested: GitHub profile → person + company + social URLs extracted.
 
-| Component | Technology |
-|-----------|-----------|
-| Backend | FastAPI + Python 3.12 (2,467 lines) |
-| Frontend | SvelteKit 5 + Tailwind v4 (4,649 lines) |
+## Frontend
+
+SvelteKit 5 + Tailwind v4 + Svelte 5 runes. Routes:
+
+| Route | Purpose |
+|-------|---------|
+| `/login` | email/phone + password/PIN, show-pw, remember me |
+| `/upload` | hero camera + 3 inputs (camera/library/files) + EXIF/geo capture |
+| `/queue` | batch list, inline expand, retry, delete |
+| `/chat` | streaming SSE + SQL tool steps + citations + feedback + voice |
+| `/data` | grouped 3-section nav: Catalog (7), Insights (10), Workspace (3) |
+| `/users` | admin: CRUD users |
+
+20 sub-tabs include ProductsTable, ContactsTable, CompaniesTable, CategoriesTable, SpecsTable, Gallery, LocationsMap (Leaflet), Timeline, Countries, Messengers, QrCodes, Quality, Duplicates, SyncSources, Cameras, Pricing, Tags, Notes, Meetings.
+
+## Tech stack
+
+| Layer | Choice |
+|-------|--------|
+| Backend | FastAPI + Python 3.12 (3,500 LOC) |
+| Frontend | SvelteKit 5 + Tailwind v4 (5,500 LOC) |
 | LLM | Gemini 3.1 Flash Lite via OpenRouter |
 | Embeddings | OpenAI text-embedding-3-small via OpenRouter |
-| Database | SQLite (WAL) + FTS5 + normalized tables |
-| Vectors | ChromaDB (persistent, local) |
-| Design | Brutalist (Space Grotesk, no border-radius) |
-| Deploy | Docker (multi-stage, healthcheck) |
-| PWA | Installable, network-first caching |
+| DB | SQLite WAL + FTS5 + 12 tables + UUIDs |
+| Vectors | ChromaDB (daily prune) |
+| Auth | bcrypt + passlib + itsdangerous + phonenumbers |
+| QR | pyzbar + cv2 (with rotation fallback) |
+| Image | Pillow + pillow-heif + imagehash + cv2 Laplacian |
+| Rate limit | slowapi |
+| Deploy | Docker multi-stage + Caddy (auto Let's Encrypt) |
+| PWA | manifest + service worker (network-first) |
 
-## Environment
+## Configuration (.env)
 
-| Variable | Required | Default |
-|----------|----------|---------|
-| `OPENROUTER_API_KEY` | Yes | — |
-| `VISION_MODEL` | No | `google/gemini-3.1-flash-lite-preview` |
-| `EMBEDDING_MODEL` | No | `openai/text-embedding-3-small` |
-| `MAX_WORKERS` | No | `8` |
-| `PORT` | No | `8000` |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OPENROUTER_API_KEY` | — | required |
+| `SESSION_SECRET` | — | ≥32 chars, fails startup if missing/placeholder |
+| `SESSION_DAYS` | 14 | cookie lifetime |
+| `COOKIE_SECURE` | auto | `true` in prod (HTTPS) |
+| `CORS_ORIGINS` | localhost | comma-separated, no wildcard w/ credentials |
+| `SUPER_ADMIN_{EMAIL,PHONE,PASSWORD,PIN,NAME}` | — | bootstrap |
+| `MAX_UPLOAD_BYTES` | 104857600 | 100MB per file |
+| `MAX_IMAGE_PIXELS` | 100000000 | PIL bomb guard |
+| `RATE_LIMIT_ENABLED` | true | slowapi toggle |
+| `DOMAIN` | — | Caddy auto-TLS |
+| `VISION_MODEL` | google/gemini-3.1-flash-lite-preview | |
+| `EMBEDDING_MODEL` | openai/text-embedding-3-small | |
+| `MAX_WORKERS` | 8 | extraction concurrency |
+| `PORT` | 8000 | |
 
-## Project Structure
+## Commands
 
-```
-City-KONTACT/
-├── main.py              # FastAPI (25+ endpoints, SSE streaming)
-├── chat.py              # Agent with RAG + SQL tool loop + memory
-├── tools.py             # SQL tool, schema introspect, catalog summary
-├── memory.py            # Feedback + memories (JSON file-based)
-├── database.py          # SQLite + FTS5 + normalized tables + UUIDs
-├── vectorstore.py       # ChromaDB + OpenRouter embeddings
-├── config.py            # Environment-based configuration
-├── pipeline/
-│   ├── loader.py        # Image + PDF + EXIF extraction
-│   ├── extractor.py     # Async batch extraction
-│   └── agents.py        # 8 specialized extraction prompts
-├── frontend/src/routes/
-│   ├── upload/          # Camera/PDF upload with quality warnings
-│   ├── queue/           # Batch management + inline expand
-│   ├── chat/            # Agent (streaming, SQL tools, citations)
-│   ├── data/            # Document browser (metadata, filter, sort)
-│   └── more/            # Tables, gallery, search, export, stats
-├── data/
-│   ├── uploads/         # Uploaded images (portable)
-│   ├── extractions/     # JSON extraction results
-│   ├── chroma/          # Vector store
-│   └── kontact.db       # SQLite (documents + products + contacts)
-├── Dockerfile           # Multi-stage (Node + Python + healthcheck)
-├── docker-compose.yml   # Production-ready
-├── deploy.sh            # One-command deployment
-└── .env.example         # Configuration template
+```bash
+# Dev
+docker compose up -d --build kontact
+docker compose logs -f kontact
+
+# Test (synthetic fixtures + curl smoke)
+python3 /tmp/kontact_test/make_fixtures.py  # see CLAUDE.md
+curl -c jar -X POST localhost:8090/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"identifier":"admin@kontact.local","secret":"<pwd>"}'
+
+# Frontend hot reload (proxy /api → :8090)
+cd frontend && npm run dev
 ```
 
 ## License
 
-MIT
-
-## Built by RLAI Team
+MIT.

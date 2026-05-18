@@ -129,6 +129,46 @@ def index_record(folder: str, record: dict):
         collection.upsert(ids=[page_id], documents=[page_text], metadatas=[page_meta])
 
 
+def prune_orphans(valid_folders: set, valid_sources: set = None) -> int:
+    """Delete vectors whose folder is no longer in the documents table.
+
+    Call periodically (e.g. daily cron) to bound ChromaDB growth.
+    Returns the number of vectors deleted.
+    """
+    try:
+        total = collection.count()
+    except Exception:
+        return 0
+    if not total:
+        return 0
+    try:
+        all_meta = collection.get(include=["metadatas"])
+    except Exception:
+        return 0
+    ids_to_delete = []
+    for vid, meta in zip(all_meta.get("ids", []), all_meta.get("metadatas", [])):
+        if not isinstance(meta, dict):
+            continue
+        folder = meta.get("folder")
+        if folder and folder not in valid_folders:
+            ids_to_delete.append(vid)
+    if ids_to_delete:
+        try:
+            collection.delete(ids=ids_to_delete)
+        except Exception:
+            return 0
+    return len(ids_to_delete)
+
+
+def delete_by_folder(folder: str) -> int:
+    """Delete every vector tied to a folder. Called on batch deletion."""
+    try:
+        collection.delete(where={"folder": folder})
+        return 1
+    except Exception:
+        return 0
+
+
 def index_all_from_json():
     reset_collection()
     ext_dir = config.EXTRACTIONS_DIR

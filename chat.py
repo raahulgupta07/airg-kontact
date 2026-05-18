@@ -1,4 +1,4 @@
-import httpx, json, re
+import asyncio, httpx, json, re
 import config
 import database as db
 import vectorstore as vs
@@ -124,12 +124,79 @@ Columns: id, uuid, document_uuid, folder, source_file, company, person, phone, e
 - Answer "where was I?" by checking GPS coordinates
 - Answer "when did I scan this?" by checking date_taken
 - Connect products to companies to contacts — give the full picture
-- Be helpful like a smart trade show assistant"""
+- Be helpful like a smart trade show assistant
+
+## Messenger, QR & Sync Tools (extended)
+
+You also have these messenger/sync-aware tools:
+
+[TOOL: open_messenger]
+{"contact_uuid": "<uuid>", "platform": "whatsapp"}
+[/TOOL]
+
+[TOOL: fetch_catalog_url]
+{"url": "https://vendor.example/catalog.html"}
+[/TOOL]
+
+[TOOL: find_unmapped_wechat_chats]
+{}
+[/TOOL]
+
+[TOOL: list_messenger_contacts]
+{"platform": "wechat"}
+[/TOOL]
+
+### Extended tool descriptions:
+- **open_messenger** — Build a clickable deeplink for a contact on a given messenger. Args: {"contact_uuid": "...", "platform": "whatsapp|viber|telegram|line|signal|wechat|zalo"}. Use this whenever the user asks to "open", "message", "DM", or "chat with" a contact.
+- **fetch_catalog_url** — HTTP GET a catalog URL (browser UA, 30s timeout). Returns content-type, size, and first 2000 chars of stripped text (PDF returns metadata only). Read-only — no DB writes. Args: {"url": "..."}.
+- **find_unmapped_wechat_chats** — List WeChat chats from `wechat_chat_map` that have no `vendor_company` assigned yet. No args. Use to surface sync gaps.
+- **list_messenger_contacts** — List contacts that have a handle for a given platform. Args: {"platform": "whatsapp|viber|telegram|line|wechat|signal|zalo"}.
+
+### Extended schema (new columns):
+
+**contacts** (additional columns):
+`wechat_id, wechat_qr_url, whatsapp, viber, telegram, line_id, signal_phone, messengers (JSON), phone_e164`
+
+**documents** (additional columns):
+`catalog_url, qr_payloads (JSON), source_channel, source_sender, file_hash`
+
+**wechat_chat_map** — maps WeChat chats to vendor_company; rows with NULL vendor_company are unmapped sync candidates.
+
+### Extended smart query examples:
+- "Show WhatsApp contacts" → `SELECT company, person, whatsapp FROM contacts WHERE whatsapp IS NOT NULL`
+- "Vendors on WeChat" → `SELECT company, person, wechat_id, wechat_qr_url FROM contacts WHERE wechat_id IS NOT NULL OR wechat_qr_url IS NOT NULL`
+- "Catalogs sent via WeChat" → `SELECT folder, source_sender, catalog_url FROM documents WHERE source_channel = 'wechat_desktop'`
+- "Multi-platform vendors" → `SELECT company, person, json_array_length(messengers) AS platforms FROM contacts WHERE messengers IS NOT NULL ORDER BY platforms DESC` (or count non-null platform columns: `(whatsapp IS NOT NULL) + (wechat_id IS NOT NULL) + (telegram IS NOT NULL) + (line_id IS NOT NULL) + (viber IS NOT NULL) + (signal_phone IS NOT NULL)`)
+- "Vendors with all 3 (phone/email/wechat)" → `SELECT company, person, phone_e164, email, wechat_id FROM contacts WHERE phone_e164 IS NOT NULL AND email IS NOT NULL AND wechat_id IS NOT NULL`
+- "Open WhatsApp for Acme" → first SELECT the uuid (`SELECT uuid FROM contacts WHERE company='Acme'`), then call `open_messenger(contact_uuid, 'whatsapp')`.
+- "Unmapped WeChat chats" → call `find_unmapped_wechat_chats`.
+- "Fetch this catalog URL" → call `fetch_catalog_url`.
+
+## Extended Guidelines
+
+- Prefer **`phone_e164`** (E.164 normalized form) for dedup, joins, and cross-platform identity checks instead of free-form `phone`.
+- **WeChat QR tickets expire** (typically ~7 days). When surfacing `wechat_qr_url` to the user, warn that the QR may be expired and suggest using `wechat_id` as fallback.
+- When the user asks to message / open / DM / chat with a contact, **always** use the `open_messenger` tool so the user gets a clickable deeplink — do not hand-craft URLs in prose.
+- When listing vendors by messenger presence, prefer `list_messenger_contacts` for the common case; fall back to `query_catalog_db` for combined / complex filters."""
 
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(user: dict = None) -> str:
     """Assemble the full system prompt with learning context."""
     parts = [_SYSTEM_BASE]
+
+    if user:
+        name = user.get("name") or user.get("email") or user.get("uuid", "")
+        role = user.get("role", "user")
+        if role in ("super_admin", "admin"):
+            scope = "You are an admin — you can see ALL data across all users."
+        else:
+            scope = (
+                f"You see data scoped to user {name} (uuid={user.get('uuid')}). "
+                "Strict privacy: you ONLY see rows owned by this user (sharing is disabled). "
+                "The tables `documents`, `contacts`, `products` are automatically "
+                "filtered for you — query them normally."
+            )
+        parts.append(f"\n\n## Tenancy Scope\n\n{scope}")
 
     learning = build_learning_context()
     if learning:
@@ -155,15 +222,27 @@ async def _call_llm(messages: list, max_tokens: int = 2000, temperature: float =
         "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
+    # Retry on 429/5xx and transient network errors with exponential backoff
+    last_err = None
     async with httpx.AsyncClient() as client:
-        r = await client.post(config.OPENROUTER_BASE, json=payload, headers=headers, timeout=60)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        for attempt in range(3):
+            try:
+                r = await client.post(config.OPENROUTER_BASE, json=payload, headers=headers, timeout=60)
+                if r.status_code == 429 or r.status_code >= 500:
+                    last_err = httpx.HTTPStatusError(f"LLM {r.status_code}", request=r.request, response=r)
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"]
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
+                last_err = e
+                await asyncio.sleep(2 ** attempt)
+    raise last_err or RuntimeError("LLM call failed after retries")
 
 
 # ── Tool execution loop ──────────────────────────────────────────────────────
 
-async def _run_tool_loop(messages: list, initial_response: str) -> str:
+async def _run_tool_loop(messages: list, initial_response: str, user: dict = None) -> str:
     """
     If the LLM response contains tool calls, execute them and feed results
     back for up to MAX_TOOL_ITERATIONS rounds.
@@ -179,7 +258,7 @@ async def _run_tool_loop(messages: list, initial_response: str) -> str:
         # Execute each tool and build a result message
         tool_results = []
         for tc in tool_calls:
-            result = execute_tool(tc["name"], tc["args"])
+            result = execute_tool(tc["name"], tc["args"], user=user)
             tool_results.append(f"[RESULT: {tc['name']}]\n{result}\n[/RESULT]")
 
         result_block = "\n\n".join(tool_results)
@@ -197,12 +276,12 @@ async def _run_tool_loop(messages: list, initial_response: str) -> str:
 
 # ── Main ask function ────────────────────────────────────────────────────────
 
-async def ask(question: str, session_id: str = None, history: list = None) -> dict:
+async def ask(question: str, session_id: str = None, history: list = None, user: dict = None) -> dict:
     context = _build_context(question)
-    system_prompt = _build_system_prompt()
+    system_prompt = _build_system_prompt(user=user)
 
     if session_id and not history:
-        history = db.get_chat_history(session_id, limit=6)
+        history = db.get_chat_history(session_id, limit=6, user=user)
 
     messages = [{"role": "system", "content": system_prompt}]
     if history:
@@ -216,7 +295,7 @@ async def ask(question: str, session_id: str = None, history: list = None) -> di
 
     # Tool execution loop (if the LLM wants to use tools)
     if _has_tool_calls(response):
-        response = await _run_tool_loop(messages, response)
+        response = await _run_tool_loop(messages, response, user=user)
 
     sources = []
     for s in vs.query(question, n_results=3):
@@ -224,7 +303,8 @@ async def ask(question: str, session_id: str = None, history: list = None) -> di
                         "company": s["metadata"].get("company", "")})
 
     if session_id:
-        db.save_chat(session_id, "user", question)
-        db.save_chat(session_id, "assistant", response)
+        uid = (user or {}).get("uuid") if user else None
+        db.save_chat(session_id, "user", question, user_uuid=uid)
+        db.save_chat(session_id, "assistant", response, user_uuid=uid)
 
     return {"answer": response, "sources": sources, "session_id": session_id}

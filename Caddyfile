@@ -1,0 +1,14 @@
+{$DOMAIN:kontact.example.com} {
+    encode gzip zstd
+
+    # Larger upload limit for photos
+    request_body {
+        max_size 100MB
+    }
+
+    reverse_proxy kontact:8090 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}

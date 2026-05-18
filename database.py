@@ -1,5 +1,7 @@
-import sqlite3, json, os
+import sqlite3, json, os, hashlib
 from uuid import uuid4
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import config
 
 DB_PATH = os.path.join(config.DATA_DIR, "kontact.db")
@@ -10,7 +12,238 @@ def _conn():
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA busy_timeout=30000")
+    c.execute("PRAGMA foreign_keys=ON")
     return c
+
+
+@contextmanager
+def db():
+    """Context manager wrapping _conn() — auto-closes."""
+    c = _conn()
+    try:
+        yield c
+    finally:
+        c.close()
+
+
+def _add_column(c, table: str, col_def: str):
+    """Idempotently add a column to a table (no-op if it already exists)."""
+    col_name = col_def.split()[0]
+    try:
+        existing = {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+    except sqlite3.OperationalError:
+        return
+    if col_name in existing:
+        return
+    try:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+        c.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+def _migrate_columns(c):
+    """Idempotent ALTER TABLE for added columns. Each in its own try/except."""
+    contact_cols = [
+        "wechat_id TEXT",
+        "wechat_qr_url TEXT",
+        "whatsapp TEXT",
+        "viber TEXT",
+        "telegram TEXT",
+        "line_id TEXT",
+        "signal_phone TEXT",
+        "messengers TEXT",
+        "phone_e164 TEXT",
+    ]
+    for col_def in contact_cols:
+        try:
+            c.execute(f"ALTER TABLE contacts ADD COLUMN {col_def}")
+            c.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    doc_cols = [
+        "catalog_url TEXT",
+        "qr_payloads TEXT",
+        "source_channel TEXT",
+        "source_sender TEXT",
+        "file_hash TEXT",
+    ]
+    for col_def in doc_cols:
+        try:
+            c.execute(f"ALTER TABLE documents ADD COLUMN {col_def}")
+            c.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    # ── Expanded EXIF / geocode / quality / client metadata columns ──
+    expanded_doc_cols = [
+        "gps_altitude REAL",
+        "gps_heading REAL",
+        "gps_speed REAL",
+        "gps_source TEXT",
+        "gps_accuracy REAL",
+        "country TEXT",
+        "city TEXT",
+        "address_full TEXT",
+        "lens_model TEXT",
+        "focal_length REAL",
+        "f_number REAL",
+        "iso INTEGER",
+        "exposure_time TEXT",
+        "software TEXT",
+        "sub_sec_time TEXT",
+        "client_timezone TEXT",
+        "client_user_agent TEXT",
+        "client_ip TEXT",
+        "client_timestamp TEXT",
+        "image_phash TEXT",
+        "blur_score REAL",
+        "is_blurry INTEGER DEFAULT 0",
+        "near_dup_of TEXT",
+    ]
+    for col_def in expanded_doc_cols:
+        _add_column(c, "documents", col_def)
+
+    _add_column(c, "documents", "device_signals TEXT")  # JSON blob
+
+    for idx_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_docs_country ON documents(country)",
+        "CREATE INDEX IF NOT EXISTS idx_docs_city ON documents(city)",
+        "CREATE INDEX IF NOT EXISTS idx_docs_phash ON documents(image_phash)",
+        "CREATE INDEX IF NOT EXISTS idx_docs_blur ON documents(is_blurry)",
+    ):
+        try:
+            c.execute(idx_sql)
+            c.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    # ── Tenancy / ownership columns ───────────────────────────────
+    _add_column(c, "documents", "owner_uuid TEXT")
+    _add_column(c, "documents", "is_shared INTEGER DEFAULT 0")
+    _add_column(c, "contacts", "owner_uuid TEXT")
+    _add_column(c, "contacts", "is_shared INTEGER DEFAULT 0")
+    _add_column(c, "products", "owner_uuid TEXT")
+    _add_column(c, "products", "is_shared INTEGER DEFAULT 0")
+    _add_column(c, "queue", "owner_uuid TEXT")
+
+    # Indexes
+    try:
+        c.execute("CREATE INDEX IF NOT EXISTS idx_contacts_phone_e164 ON contacts(phone_e164)")
+        c.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        # Dedup is handled via near_dup_of + image_phash; a UNIQUE here
+        # collides with INSERT OR REPLACE and breaks FKs to products/contacts.
+        c.execute("DROP INDEX IF EXISTS idx_doc_filehash")
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_filehash ON documents(file_hash) WHERE file_hash IS NOT NULL"
+        )
+        c.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Tenancy indexes
+    for idx_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_docs_owner ON documents(owner_uuid)",
+        "CREATE INDEX IF NOT EXISTS idx_docs_shared ON documents(is_shared)",
+        "CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner_uuid)",
+        "CREATE INDEX IF NOT EXISTS idx_products_owner ON products(owner_uuid)",
+    ):
+        try:
+            c.execute(idx_sql)
+            c.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    # ── Audit columns (updated_at, source_channel, edit_count, owner_name) ──
+    _add_column(c, "documents", "updated_at TEXT")
+    _add_column(c, "documents", "source_channel TEXT DEFAULT 'upload'")
+    _add_column(c, "documents", "edit_count INTEGER DEFAULT 0")
+
+    _add_column(c, "contacts", "updated_at TEXT")
+    _add_column(c, "contacts", "source_channel TEXT DEFAULT 'upload'")
+    _add_column(c, "contacts", "edit_count INTEGER DEFAULT 0")
+    _add_column(c, "contacts", "owner_name TEXT")
+
+    _add_column(c, "products", "updated_at TEXT")
+    _add_column(c, "products", "source_channel TEXT DEFAULT 'upload'")
+    _add_column(c, "products", "edit_count INTEGER DEFAULT 0")
+
+    _add_column(c, "queue", "updated_at TEXT")
+    _add_column(c, "queue", "source_channel TEXT DEFAULT 'upload'")
+
+    # chat_history: scope to user
+    _add_column(c, "chat_history", "user_uuid TEXT")
+    try:
+        c.execute("CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_history(user_uuid)")
+        c.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Tenancy helpers
+# ---------------------------------------------------------------------------
+def visibility_clause(table_alias, user):
+    """Returns (sql_fragment, params) gating rows by ownership.
+    Strict per-user. super_admin and admin see all. Users see ONLY own."""
+    if not user:
+        return ("", [])
+    if user.get("role") in ("super_admin", "admin"):
+        return ("", [])
+    a = f"{table_alias}." if table_alias else ""
+    return (f"{a}owner_uuid = ?", [user["uuid"]])
+
+
+def can_edit(row: dict, user: dict) -> bool:
+    """User may edit row if they own it OR are admin/super_admin."""
+    if not user:
+        return False
+    if user.get("role") in ("super_admin", "admin"):
+        return True
+    return bool(row) and row.get("owner_uuid") == user.get("uuid")
+
+
+def backfill_ownership(c):
+    """One-time backfill: legacy rows get assigned to super_admin and marked shared."""
+    try:
+        cnt = c.execute("SELECT COUNT(*) FROM documents WHERE owner_uuid IS NULL").fetchone()[0]
+    except sqlite3.OperationalError:
+        return
+    if cnt == 0:
+        return
+    try:
+        admin = c.execute("SELECT uuid FROM users WHERE role='super_admin' LIMIT 1").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if not admin:
+        return
+    uid = admin["uuid"]
+    # legacy rows now private to super_admin under strict mode
+    c.execute("UPDATE documents SET owner_uuid=?, is_shared=0 WHERE owner_uuid IS NULL", (uid,))
+    c.execute("UPDATE contacts SET owner_uuid=?, is_shared=0 WHERE owner_uuid IS NULL", (uid,))
+    c.execute("UPDATE products SET owner_uuid=?, is_shared=0 WHERE owner_uuid IS NULL", (uid,))
+    c.execute("UPDATE queue SET owner_uuid=? WHERE owner_uuid IS NULL", (uid,))
+    # Backfill chat_history user_uuid for any NULL → super_admin
+    try:
+        c.execute("UPDATE chat_history SET user_uuid=? WHERE user_uuid IS NULL", (uid,))
+    except sqlite3.OperationalError:
+        pass
+    c.commit()
+    print(f"[tenancy] backfilled {cnt} legacy rows to super_admin (private under strict mode)")
+
+
+def run_tenancy_backfill():
+    """Public entry point — call after users table + super_admin exist."""
+    c = _conn()
+    try:
+        backfill_ownership(c)
+        backfill_aux_tables(c)
+    finally:
+        c.close()
 
 
 def init_db():
@@ -96,7 +329,15 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (document_id) REFERENCES documents(id)
         );
+        CREATE TABLE IF NOT EXISTS wechat_chat_map (
+            chat_hash TEXT PRIMARY KEY,
+            vendor_company TEXT,
+            contact_uuid TEXT,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
+    _migrate_columns(c)
 
     # Add uuid column to documents if not exists (SQLite has no IF NOT EXISTS for ALTER)
     try:
@@ -129,10 +370,439 @@ def init_db():
         except Exception:
             pass  # Column already exists
 
+    _migrate_auth_tables(c)
+    _migrate_aux_tables(c)
+
     c.close()
 
 
-def insert_extraction(folder: str, record: dict):
+def _migrate_aux_tables(c):
+    """Create tags, document_tags, notes, meetings, events tables (idempotent)."""
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT UNIQUE NOT NULL,
+            name TEXT UNIQUE NOT NULL,
+            color TEXT DEFAULT '#C96442',
+            created_at TEXT NOT NULL,
+            created_by TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS document_tags (
+            document_uuid TEXT NOT NULL,
+            tag_uuid TEXT NOT NULL,
+            added_at TEXT NOT NULL,
+            added_by TEXT,
+            PRIMARY KEY (document_uuid, tag_uuid)
+        );
+
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT UNIQUE NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_uuid TEXT NOT NULL,
+            body TEXT NOT NULL,
+            owner_uuid TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_notes_entity ON notes(entity_type, entity_uuid);
+        CREATE INDEX IF NOT EXISTS idx_notes_owner ON notes(owner_uuid);
+
+        CREATE TABLE IF NOT EXISTS meetings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT UNIQUE NOT NULL,
+            contact_uuid TEXT,
+            company TEXT,
+            person TEXT,
+            meeting_date TEXT NOT NULL,
+            location TEXT,
+            city TEXT,
+            notes TEXT,
+            outcome TEXT,
+            owner_uuid TEXT NOT NULL,
+            is_shared INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_meetings_contact ON meetings(contact_uuid);
+        CREATE INDEX IF NOT EXISTS idx_meetings_owner ON meetings(owner_uuid);
+        CREATE INDEX IF NOT EXISTS idx_meetings_date ON meetings(meeting_date);
+
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            entity_type TEXT,
+            entity_uuid TEXT,
+            user_uuid TEXT,
+            detail_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+        CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_uuid);
+        CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+    """)
+    c.commit()
+
+
+# ---------------------------------------------------------------------------
+# Aux helpers: tags, document_tags, notes, meetings, events
+# ---------------------------------------------------------------------------
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ── Tags ────────────────────────────────────────────────────────────
+def create_tag(c, name: str, color: str = None, user_uuid: str = None) -> str:
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("tag name required")
+    existing = c.execute("SELECT uuid FROM tags WHERE name = ?", (name,)).fetchone()
+    if existing:
+        return existing["uuid"]
+    new_uuid = str(uuid4())
+    c.execute(
+        "INSERT INTO tags (uuid, name, color, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
+        (new_uuid, name, color or "#C96442", _now_iso(), user_uuid),
+    )
+    c.commit()
+    return new_uuid
+
+
+def list_tags(c, user=None):
+    rows = c.execute("SELECT * FROM tags ORDER BY name").fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_tag(c, tag_uuid: str) -> int:
+    n = c.execute("DELETE FROM tags WHERE uuid = ?", (tag_uuid,)).rowcount
+    c.execute("DELETE FROM document_tags WHERE tag_uuid = ?", (tag_uuid,))
+    c.commit()
+    return n
+
+
+def get_tag(c, tag_uuid: str):
+    row = c.execute("SELECT * FROM tags WHERE uuid = ?", (tag_uuid,)).fetchone()
+    return dict(row) if row else None
+
+
+def tag_document(c, doc_uuid: str, tag_uuid: str, user_uuid: str = None) -> int:
+    try:
+        c.execute(
+            "INSERT INTO document_tags (document_uuid, tag_uuid, added_at, added_by) VALUES (?, ?, ?, ?)",
+            (doc_uuid, tag_uuid, _now_iso(), user_uuid),
+        )
+        c.commit()
+        return 1
+    except sqlite3.IntegrityError:
+        return 0
+
+
+def untag_document(c, doc_uuid: str, tag_uuid: str) -> int:
+    n = c.execute(
+        "DELETE FROM document_tags WHERE document_uuid = ? AND tag_uuid = ?",
+        (doc_uuid, tag_uuid),
+    ).rowcount
+    c.commit()
+    return n
+
+
+def list_doc_tags(c, doc_uuid: str):
+    rows = c.execute(
+        "SELECT t.uuid, t.name, t.color FROM tags t "
+        "JOIN document_tags dt ON dt.tag_uuid = t.uuid WHERE dt.document_uuid = ? "
+        "ORDER BY t.name",
+        (doc_uuid,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Notes ───────────────────────────────────────────────────────────
+def create_note(c, entity_type: str, entity_uuid: str, body: str, owner_uuid: str) -> str:
+    new_uuid = str(uuid4())
+    c.execute(
+        "INSERT INTO notes (uuid, entity_type, entity_uuid, body, owner_uuid, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (new_uuid, entity_type, entity_uuid, body, owner_uuid, _now_iso()),
+    )
+    c.commit()
+    return new_uuid
+
+
+def list_notes(c, entity_type: str, entity_uuid: str, user=None):
+    rows = c.execute(
+        "SELECT * FROM notes WHERE entity_type = ? AND entity_uuid = ? ORDER BY created_at DESC",
+        (entity_type, entity_uuid),
+    ).fetchall()
+    out = [dict(r) for r in rows]
+    if not user or user.get("role") in ("super_admin", "admin"):
+        return out
+    uid = user["uuid"]
+    return [n for n in out if n.get("owner_uuid") == uid]
+
+
+def get_note(c, note_uuid: str):
+    row = c.execute("SELECT * FROM notes WHERE uuid = ?", (note_uuid,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_note(c, note_uuid: str, body: str, user_uuid: str) -> int:
+    row = c.execute("SELECT owner_uuid FROM notes WHERE uuid = ?", (note_uuid,)).fetchone()
+    if not row:
+        return 0
+    if row["owner_uuid"] != user_uuid:
+        return -1  # forbidden sentinel
+    n = c.execute(
+        "UPDATE notes SET body = ?, updated_at = ? WHERE uuid = ?",
+        (body, _now_iso(), note_uuid),
+    ).rowcount
+    c.commit()
+    return n
+
+
+def delete_note(c, note_uuid: str, user_uuid: str, is_admin: bool = False) -> int:
+    row = c.execute("SELECT owner_uuid FROM notes WHERE uuid = ?", (note_uuid,)).fetchone()
+    if not row:
+        return 0
+    if not is_admin and row["owner_uuid"] != user_uuid:
+        return -1
+    n = c.execute("DELETE FROM notes WHERE uuid = ?", (note_uuid,)).rowcount
+    c.commit()
+    return n
+
+
+# ── Meetings ────────────────────────────────────────────────────────
+_MEETING_UPDATABLE = {"contact_uuid", "company", "person", "meeting_date",
+                      "location", "city", "notes", "outcome", "is_shared"}
+
+
+def create_meeting(c, owner_uuid: str, **fields) -> str:
+    new_uuid = str(uuid4())
+    contact_uuid = fields.get("contact_uuid")
+    company = fields.get("company")
+    person = fields.get("person")
+    meeting_date = fields.get("meeting_date") or _now_iso()
+    location = fields.get("location")
+    city = fields.get("city")
+    notes = fields.get("notes")
+    outcome = fields.get("outcome")
+    is_shared = int(bool(fields.get("is_shared")))
+    c.execute(
+        "INSERT INTO meetings (uuid, contact_uuid, company, person, meeting_date, "
+        "location, city, notes, outcome, owner_uuid, is_shared, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (new_uuid, contact_uuid, company, person, meeting_date,
+         location, city, notes, outcome, owner_uuid, is_shared, _now_iso()),
+    )
+    c.commit()
+    return new_uuid
+
+
+def list_meetings(c, user=None, contact_uuid: str = None):
+    where = []
+    params = []
+    if contact_uuid:
+        where.append("contact_uuid = ?")
+        params.append(contact_uuid)
+    vc, vp = visibility_clause("", user)
+    if vc:
+        where.append(vc)
+        params.extend(vp)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = c.execute(
+        f"SELECT * FROM meetings {where_sql} ORDER BY meeting_date DESC",
+        params,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_meeting(c, meeting_uuid: str):
+    row = c.execute("SELECT * FROM meetings WHERE uuid = ?", (meeting_uuid,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_meeting(c, meeting_uuid: str, fields: dict, user_uuid: str, is_admin: bool = False) -> int:
+    row = c.execute("SELECT owner_uuid FROM meetings WHERE uuid = ?", (meeting_uuid,)).fetchone()
+    if not row:
+        return 0
+    if not is_admin and row["owner_uuid"] != user_uuid:
+        return -1
+    sets = {k: v for k, v in (fields or {}).items() if k in _MEETING_UPDATABLE}
+    if not sets:
+        return 0
+    if "is_shared" in sets:
+        sets["is_shared"] = int(bool(sets["is_shared"]))
+    cols = ", ".join(f"{k} = ?" for k in sets)
+    params = list(sets.values()) + [meeting_uuid]
+    n = c.execute(f"UPDATE meetings SET {cols} WHERE uuid = ?", params).rowcount
+    c.commit()
+    return n
+
+
+def delete_meeting(c, meeting_uuid: str, user_uuid: str, is_admin: bool = False) -> int:
+    row = c.execute("SELECT owner_uuid FROM meetings WHERE uuid = ?", (meeting_uuid,)).fetchone()
+    if not row:
+        return 0
+    if not is_admin and row["owner_uuid"] != user_uuid:
+        return -1
+    n = c.execute("DELETE FROM meetings WHERE uuid = ?", (meeting_uuid,)).rowcount
+    c.commit()
+    return n
+
+
+# ── Events / audit ──────────────────────────────────────────────────
+def log_event(c, event_type: str, entity_type: str = None, entity_uuid: str = None,
+              user_uuid: str = None, detail: dict = None):
+    """Best-effort audit log insert. Never raise."""
+    try:
+        detail_json = json.dumps(detail, ensure_ascii=False) if detail else None
+        c.execute(
+            "INSERT INTO events (ts, event_type, entity_type, entity_uuid, user_uuid, detail_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (_now_iso(), event_type, entity_type, entity_uuid, user_uuid, detail_json),
+        )
+        c.commit()
+    except Exception:
+        pass
+
+
+def log_event_safe(event_type: str, entity_type: str = None, entity_uuid: str = None,
+                   user_uuid: str = None, detail: dict = None):
+    """Convenience: open own connection, log, close. Never raise."""
+    try:
+        conn = _conn()
+        try:
+            log_event(conn, event_type, entity_type, entity_uuid, user_uuid, detail)
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def list_events(c, limit: int = 100, user_uuid: str = None, event_type: str = None,
+                requester=None):
+    where = []
+    params = []
+    # non-admin can only see own events
+    if requester and requester.get("role") not in ("super_admin", "admin"):
+        where.append("user_uuid = ?")
+        params.append(requester["uuid"])
+    else:
+        if user_uuid:
+            where.append("user_uuid = ?")
+            params.append(user_uuid)
+    if event_type:
+        where.append("event_type = ?")
+        params.append(event_type)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = c.execute(
+        f"SELECT * FROM events {where_sql} ORDER BY id DESC LIMIT ?",
+        (*params, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def backfill_aux_tables(c=None):
+    """No-op currently — tables created empty. Just log."""
+    print("[aux] notes/meetings/tags/events tables ready")
+
+
+def _migrate_auth_tables(c):
+    """Create users + login_attempts tables (idempotent)."""
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE,
+            phone_e164 TEXT UNIQUE,
+            password_hash TEXT,
+            pin_hash TEXT,
+            role TEXT NOT NULL DEFAULT 'user',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            created_by TEXT,
+            last_login TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+        CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone_e164);
+
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            identifier TEXT NOT NULL,
+            ip TEXT,
+            success INTEGER NOT NULL,
+            at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_id_at ON login_attempts(identifier, at);
+    """)
+    c.commit()
+
+
+# ─── Auth: users CRUD ────────────────────────────────────────────────
+_USER_UPDATABLE = {"name", "email", "phone_e164", "password_hash", "pin_hash", "role", "is_active"}
+
+
+def get_user_by_identifier(c, identifier_kind: str, value: str):
+    if identifier_kind == "email":
+        return c.execute("SELECT * FROM users WHERE email = ?", (value,)).fetchone()
+    if identifier_kind == "phone":
+        return c.execute("SELECT * FROM users WHERE phone_e164 = ?", (value,)).fetchone()
+    return None
+
+
+def get_user_by_uuid(c, user_uuid: str):
+    return c.execute("SELECT * FROM users WHERE uuid = ?", (user_uuid,)).fetchone()
+
+
+def create_user(c, name, email, phone_e164, password_hash, pin_hash, role, created_by):
+    new_uuid = str(uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    c.execute(
+        "INSERT INTO users(uuid, name, email, phone_e164, password_hash, pin_hash, role, is_active, created_at, created_by) "
+        "VALUES (?,?,?,?,?,?,?,1,?,?)",
+        (new_uuid, name, email, phone_e164, password_hash, pin_hash, role, now, created_by),
+    )
+    c.commit()
+    return new_uuid
+
+
+def update_user(c, user_uuid: str, updates: dict) -> int:
+    fields = {k: v for k, v in (updates or {}).items() if k in _USER_UPDATABLE}
+    if not fields:
+        return 0
+    sets = ", ".join(f"{k} = ?" for k in fields.keys())
+    params = list(fields.values()) + [user_uuid]
+    cur = c.execute(f"UPDATE users SET {sets} WHERE uuid = ?", params)
+    c.commit()
+    return cur.rowcount
+
+
+def list_users(c):
+    return c.execute(
+        "SELECT * FROM users ORDER BY CASE role WHEN 'super_admin' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, created_at"
+    ).fetchall()
+
+
+def delete_user(c, user_uuid: str) -> int:
+    row = c.execute("SELECT role FROM users WHERE uuid = ?", (user_uuid,)).fetchone()
+    if not row:
+        return 0
+    if row["role"] == "super_admin":
+        raise ValueError("cannot delete super_admin")
+    cur = c.execute("DELETE FROM users WHERE uuid = ?", (user_uuid,))
+    c.commit()
+    return cur.rowcount
+
+
+def touch_login(c, user_uuid: str):
+    now = datetime.now(timezone.utc).isoformat()
+    c.execute("UPDATE users SET last_login = ? WHERE uuid = ?", (now, user_uuid))
+    c.commit()
+
+
+def insert_extraction(folder: str, record: dict, owner_uuid: str = None, is_shared: int = 0,
+                      metadata_extra: dict = None):
     c = _conn()
     doc_uuid = str(uuid4())
     metadata_json = None
@@ -145,15 +815,73 @@ def insert_extraction(folder: str, record: dict):
     date_taken = meta.get("date_taken")
     camera_make = meta.get("camera_make")
     camera_model = meta.get("camera_model")
-    img_width = meta.get("img_width")
-    img_height = meta.get("img_height")
+    img_width = meta.get("img_width") or meta.get("width")
+    img_height = meta.get("img_height") or meta.get("height")
     file_size_kb = meta.get("file_size_kb")
+
+    # Compute file_hash from source_path if it exists
+    file_hash = None
+    src_path = record.get("source_path", "") or ""
+    if src_path and os.path.exists(src_path):
+        try:
+            file_hash = compute_file_hash(src_path)
+        except Exception:
+            file_hash = None
+
+    # New optional doc columns
+    qr_payloads = record.get("qr_payloads")
+    if qr_payloads is not None and not isinstance(qr_payloads, str):
+        qr_payloads = json.dumps(qr_payloads, ensure_ascii=False)
+    catalog_url = record.get("catalog_url")
+    source_channel = record.get("source_channel")
+    source_sender = record.get("source_sender")
+
+    # ── Expanded metadata (EXIF + geocode + quality + client) ──
+    mx = metadata_extra or {}
+    source_channel_val = mx.get("source_channel") or source_channel or "upload"
+    _now = _now_iso()
+    # Allow extra GPS/EXIF in metadata dict to override base meta if present
+    gps_lat = mx.get("gps_lat", gps_lat)
+    gps_lng = mx.get("gps_lng", gps_lng)
+    gps_altitude = mx.get("gps_altitude") if mx.get("gps_altitude") is not None else meta.get("gps_altitude")
+    gps_heading = mx.get("gps_heading") if mx.get("gps_heading") is not None else meta.get("gps_heading")
+    gps_speed = mx.get("gps_speed") if mx.get("gps_speed") is not None else meta.get("gps_speed")
+    gps_source = mx.get("gps_source")
+    gps_accuracy = mx.get("gps_accuracy")
+    country = mx.get("country")
+    city = mx.get("city")
+    address_full = mx.get("address_full")
+    lens_model = mx.get("lens_model") if mx.get("lens_model") is not None else meta.get("lens_model")
+    focal_length = mx.get("focal_length") if mx.get("focal_length") is not None else meta.get("focal_length")
+    f_number = mx.get("f_number") if mx.get("f_number") is not None else meta.get("f_number")
+    iso_v = mx.get("iso") if mx.get("iso") is not None else meta.get("iso")
+    exposure_time = mx.get("exposure_time") if mx.get("exposure_time") is not None else meta.get("exposure_time")
+    software = mx.get("software") if mx.get("software") is not None else meta.get("software")
+    sub_sec_time = mx.get("sub_sec_time") if mx.get("sub_sec_time") is not None else meta.get("sub_sec_time")
+    client_timezone = mx.get("client_timezone")
+    client_user_agent = mx.get("client_user_agent")
+    client_ip = mx.get("client_ip")
+    client_timestamp = mx.get("client_timestamp")
+    image_phash = mx.get("image_phash")
+    blur_score = mx.get("blur_score")
+    is_blurry_v = 1 if mx.get("is_blurry") else 0
+    near_dup_of = mx.get("near_dup_of")
+    device_signals = mx.get("device_signals")
 
     c.execute("""
         INSERT OR REPLACE INTO documents
         (folder, source_file, source_path, image_type, company, title, products, contact, key_info, raw_text, full_json, uuid, metadata,
-         gps_lat, gps_lng, date_taken, camera_make, camera_model, img_width, img_height, file_size_kb)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         gps_lat, gps_lng, date_taken, camera_make, camera_model, img_width, img_height, file_size_kb,
+         catalog_url, qr_payloads, source_channel, source_sender, file_hash,
+         owner_uuid, is_shared,
+         gps_altitude, gps_heading, gps_speed, gps_source, gps_accuracy,
+         country, city, address_full,
+         lens_model, focal_length, f_number, iso, exposure_time, software, sub_sec_time,
+         client_timezone, client_user_agent, client_ip, client_timestamp,
+         image_phash, blur_score, is_blurry, near_dup_of, device_signals,
+         updated_at, edit_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         folder,
         record.get("source_file", ""),
@@ -169,6 +897,14 @@ def insert_extraction(folder: str, record: dict):
         doc_uuid,
         metadata_json,
         gps_lat, gps_lng, date_taken, camera_make, camera_model, img_width, img_height, file_size_kb,
+        catalog_url, qr_payloads, source_channel_val, source_sender, file_hash,
+        owner_uuid, int(bool(is_shared)),
+        gps_altitude, gps_heading, gps_speed, gps_source, gps_accuracy,
+        country, city, address_full,
+        lens_model, focal_length, f_number, iso_v, exposure_time, software, sub_sec_time,
+        client_timezone, client_user_agent, client_ip, client_timestamp,
+        image_phash, blur_score, is_blurry_v, near_dup_of, device_signals,
+        _now, 0,
     ))
     doc_id = c.execute("SELECT id FROM documents WHERE folder = ? AND source_file = ?",
                        (folder, record.get("source_file", ""))).fetchone()
@@ -193,14 +929,17 @@ def insert_extraction(folder: str, record: dict):
                 specs_val = json.dumps(specs_val, ensure_ascii=False)
             try:
                 c.execute("""
-                    INSERT INTO products (uuid, document_uuid, document_id, folder, source_file, company, name, model, specs, category, price, image_desc)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO products (uuid, document_uuid, document_id, folder, source_file, company, name, model, specs, category, price, image_desc, owner_uuid, is_shared,
+                                          source_channel, updated_at, edit_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     str(uuid4()), doc_uuid, doc_id, folder, source_file,
                     p.get("company", "") or company,
                     p_name, p.get("model", ""), specs_val,
                     p.get("category", ""), p.get("price", ""),
                     p.get("image_desc", "") or p.get("description", ""),
+                    owner_uuid, int(bool(is_shared)),
+                    source_channel_val, _now, 0,
                 ))
             except Exception:
                 pass  # Skip duplicates
@@ -219,15 +958,19 @@ def insert_extraction(folder: str, record: dict):
         ct_email = contact.get("email", "") or ""
         ct_website = contact.get("website", "") or ""
         ct_address = contact.get("address", "") or ""
-        if any([ct_company, ct_person, ct_phone, ct_email, ct_website, ct_address]):
+        if any([ct_company, ct_person, ct_phone, ct_email, ct_website, ct_address]) or any(
+            contact.get(k) for k in ("wechat_id", "whatsapp", "telegram", "viber", "line_id",
+                                      "signal_phone", "phone_e164", "messengers", "wechat_qr_url")
+        ):
+            # Commit pending doc insert first so upsert_contact's separate connection sees it
+            c.commit()
             try:
-                c.execute("""
-                    INSERT INTO contacts (uuid, document_uuid, document_id, folder, source_file, company, person, phone, email, website, address)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    str(uuid4()), doc_uuid, doc_id, folder, source_file,
-                    ct_company, ct_person, ct_phone, ct_email, ct_website, ct_address,
-                ))
+                payload = dict(contact)
+                payload["folder"] = folder
+                payload["source_file"] = source_file
+                upsert_contact(payload, document_uuid=doc_uuid, document_id=doc_id,
+                               owner_uuid=owner_uuid, is_shared=int(bool(is_shared)),
+                               source_channel=source_channel_val)
             except Exception:
                 pass
 
@@ -299,35 +1042,60 @@ def get_stats() -> dict:
     }
 
 
-def save_chat(session_id: str, role: str, content: str):
+def save_chat(session_id: str, role: str, content: str, user_uuid: str = None):
     c = _conn()
-    c.execute("INSERT INTO chat_history (session_id, role, content) VALUES (?, ?, ?)",
-              (session_id, role, content))
+    c.execute(
+        "INSERT INTO chat_history (session_id, role, content, user_uuid) VALUES (?, ?, ?, ?)",
+        (session_id, role, content, user_uuid),
+    )
     c.commit()
     c.close()
 
 
-def get_chat_history(session_id: str, limit: int = 50) -> list:
+def get_chat_history(session_id: str, limit: int = 50, user: dict = None) -> list:
     c = _conn()
+    where = "session_id = ?"
+    params = [session_id]
+    if user and user.get("role") not in ("super_admin", "admin"):
+        # Strict ownership — NULL rows are pre-backfill leftovers; treat as not-mine
+        where += " AND user_uuid = ?"
+        params.append(user["uuid"])
     rows = c.execute(
-        "SELECT role, content, created_at FROM chat_history WHERE session_id = ? ORDER BY id DESC LIMIT ?",
-        (session_id, limit)).fetchall()
+        f"SELECT role, content, created_at FROM chat_history WHERE {where} ORDER BY id DESC LIMIT ?",
+        (*params, limit),
+    ).fetchall()
     c.close()
     return [dict(r) for r in reversed(rows)]
 
 
-def list_sessions() -> list:
+def list_sessions(user: dict = None) -> list:
     c = _conn()
-    rows = c.execute("""
+    where = ""
+    params: list = []
+    if user and user.get("role") not in ("super_admin", "admin"):
+        where = "WHERE user_uuid = ?"
+        params.append(user["uuid"])
+    rows = c.execute(f"""
         SELECT session_id, MIN(created_at) as started, MAX(created_at) as last_msg,
                COUNT(*) as messages,
                (SELECT SUBSTR(content, 1, 50) FROM chat_history ch2
                 WHERE ch2.session_id = chat_history.session_id AND ch2.role = 'user'
                 ORDER BY ch2.id ASC LIMIT 1) as preview
-        FROM chat_history GROUP BY session_id ORDER BY last_msg DESC
-    """).fetchall()
+        FROM chat_history {where} GROUP BY session_id ORDER BY last_msg DESC
+    """, params).fetchall()
     c.close()
     return [dict(r) for r in rows]
+
+
+def session_owner(session_id: str) -> str:
+    """Return the user_uuid that owns a chat session (first non-null user_uuid)."""
+    c = _conn()
+    row = c.execute(
+        "SELECT user_uuid FROM chat_history WHERE session_id = ? AND user_uuid IS NOT NULL LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    c.close()
+    return row["user_uuid"] if row else None
 
 
 def delete_session(session_id: str):
@@ -337,12 +1105,198 @@ def delete_session(session_id: str):
     c.close()
 
 
-def queue_add(batch_id: str, file_name: str, file_path: str):
+def queue_add(batch_id: str, file_name: str, file_path: str,
+              source_channel: str = None, source_sender: str = None, file_hash: str = None,
+              owner_uuid: str = None):
     c = _conn()
-    c.execute("INSERT INTO queue (batch_id, file_name, file_path) VALUES (?, ?, ?)",
-              (batch_id, file_name, file_path))
+    for col_def in ["source_channel TEXT", "source_sender TEXT", "file_hash TEXT", "owner_uuid TEXT"]:
+        try:
+            c.execute(f"ALTER TABLE queue ADD COLUMN {col_def}")
+            c.commit()
+        except sqlite3.OperationalError:
+            pass
+    c.execute(
+        "INSERT INTO queue (batch_id, file_name, file_path, source_channel, source_sender, file_hash, owner_uuid) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (batch_id, file_name, file_path, source_channel, source_sender, file_hash, owner_uuid),
+    )
     c.commit()
     c.close()
+
+
+def file_already_ingested(file_hash: str) -> bool:
+    if not file_hash:
+        return False
+    c = _conn()
+    try:
+        row = c.execute("SELECT 1 FROM documents WHERE file_hash = ? LIMIT 1", (file_hash,)).fetchone()
+        if row:
+            c.close()
+            return True
+    except sqlite3.OperationalError:
+        pass
+    try:
+        row = c.execute("SELECT 1 FROM queue WHERE file_hash = ? LIMIT 1", (file_hash,)).fetchone()
+        c.close()
+        return row is not None
+    except sqlite3.OperationalError:
+        c.close()
+        return False
+
+
+def wechat_map_get(chat_hash: str):
+    c = _conn()
+    row = c.execute("SELECT * FROM wechat_chat_map WHERE chat_hash = ?", (chat_hash,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+
+def wechat_map_upsert(chat_hash: str, vendor_company: str = None,
+                     contact_uuid: str = None, notes: str = None) -> dict:
+    c = _conn()
+    existing = c.execute("SELECT * FROM wechat_chat_map WHERE chat_hash = ?", (chat_hash,)).fetchone()
+    if existing:
+        c.execute(
+            "UPDATE wechat_chat_map SET vendor_company = COALESCE(?, vendor_company), "
+            "contact_uuid = COALESCE(?, contact_uuid), notes = COALESCE(?, notes) "
+            "WHERE chat_hash = ?",
+            (vendor_company, contact_uuid, notes, chat_hash),
+        )
+    else:
+        c.execute(
+            "INSERT INTO wechat_chat_map (chat_hash, vendor_company, contact_uuid, notes) "
+            "VALUES (?, ?, ?, ?)",
+            (chat_hash, vendor_company, contact_uuid, notes),
+        )
+    c.commit()
+    row = c.execute("SELECT * FROM wechat_chat_map WHERE chat_hash = ?", (chat_hash,)).fetchone()
+    c.close()
+    return dict(row) if row else {}
+
+
+def wechat_map_delete(chat_hash: str) -> int:
+    c = _conn()
+    n = c.execute("DELETE FROM wechat_chat_map WHERE chat_hash = ?", (chat_hash,)).rowcount
+    c.commit()
+    c.close()
+    return n
+
+
+def wechat_map_list() -> list:
+    c = _conn()
+    rows = c.execute("SELECT * FROM wechat_chat_map ORDER BY created_at DESC").fetchall()
+    results = []
+    for r in rows:
+        d = dict(r)
+        ch = d["chat_hash"]
+        try:
+            cnt = c.execute(
+                "SELECT COUNT(*) FROM queue WHERE source_channel = 'wechat_desktop' "
+                "AND (source_sender = ? OR source_sender = ?)",
+                (ch, d.get("vendor_company") or ""),
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            cnt = 0
+        d["file_count"] = cnt
+        results.append(d)
+    c.close()
+    return results
+
+
+def update_contact(uuid: str, fields: dict) -> int:
+    allowed = {"company", "person", "phone", "email", "website", "address",
+               "wechat_id", "wechat_qr_url", "whatsapp", "viber", "telegram",
+               "line_id", "signal_phone", "messengers", "phone_e164"}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return 0
+    c = _conn()
+    cols = ", ".join(f"{k} = ?" for k in sets)
+    vals = list(sets.values()) + [_now_iso(), uuid]
+    n = c.execute(
+        f"UPDATE contacts SET {cols}, updated_at = ?, "
+        "edit_count = COALESCE(edit_count, 0) + 1 WHERE uuid = ?",
+        vals,
+    ).rowcount
+    c.commit()
+    c.close()
+    return n
+
+
+def update_product(uuid: str, fields: dict) -> int:
+    allowed = {"company", "name", "model", "specs", "category", "price", "image_desc"}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return 0
+    c = _conn()
+    cols = ", ".join(f"{k} = ?" for k in sets)
+    vals = list(sets.values()) + [_now_iso(), uuid]
+    n = c.execute(
+        f"UPDATE products SET {cols}, updated_at = ?, "
+        "edit_count = COALESCE(edit_count, 0) + 1 WHERE uuid = ?",
+        vals,
+    ).rowcount
+    c.commit()
+    c.close()
+    return n
+
+
+def get_contact_by_uuid(uuid: str):
+    c = _conn()
+    row = c.execute("SELECT * FROM contacts WHERE uuid = ?", (uuid,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+
+def get_all_contact_records() -> list:
+    c = _conn()
+    rows = c.execute("SELECT * FROM contacts").fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def merge_contacts(keep_uuid: str, merge_uuid: str) -> dict:
+    c = _conn()
+    keep = c.execute("SELECT * FROM contacts WHERE uuid = ?", (keep_uuid,)).fetchone()
+    drop = c.execute("SELECT * FROM contacts WHERE uuid = ?", (merge_uuid,)).fetchone()
+    if not keep or not drop:
+        c.close()
+        return {"merged": False, "reason": "uuid not found"}
+    keep_d = dict(keep)
+    drop_d = dict(drop)
+    fillable = ["company", "person", "phone", "email", "website", "address",
+                "wechat_id", "wechat_qr_url", "whatsapp", "viber", "telegram",
+                "line_id", "signal_phone", "messengers", "phone_e164"]
+    updates = {}
+    for f in fillable:
+        if not keep_d.get(f) and drop_d.get(f):
+            updates[f] = drop_d[f]
+    if updates:
+        cols = ", ".join(f"{k} = ?" for k in updates)
+        vals = list(updates.values()) + [keep_uuid]
+        c.execute(f"UPDATE contacts SET {cols} WHERE uuid = ?", vals)
+    c.execute("DELETE FROM contacts WHERE uuid = ?", (merge_uuid,))
+    c.commit()
+    c.close()
+    return {"merged": True, "filled": list(updates.keys())}
+
+
+def get_document(doc_id: int):
+    c = _conn()
+    row = c.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+
+def update_document_qr(doc_id: int, qr_payloads: list) -> int:
+    c = _conn()
+    n = c.execute(
+        "UPDATE documents SET qr_payloads = ? WHERE id = ?",
+        (json.dumps(qr_payloads, ensure_ascii=False), doc_id),
+    ).rowcount
+    c.commit()
+    c.close()
+    return n
 
 
 def queue_pending(batch_id: str = None) -> list:
@@ -679,6 +1633,493 @@ def backfill_metadata_columns():
         ))
     c.commit()
     c.close()
+
+
+# ---------------------------------------------------------------------------
+# File hash / dedup helpers
+# ---------------------------------------------------------------------------
+def compute_file_hash(path: str) -> str:
+    """SHA256 of a file, streamed in 64KB chunks."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def file_already_ingested(file_hash: str) -> bool:
+    if not file_hash:
+        return False
+    c = _conn()
+    row = c.execute("SELECT 1 FROM documents WHERE file_hash = ? LIMIT 1", (file_hash,)).fetchone()
+    c.close()
+    return row is not None
+
+
+# ---------------------------------------------------------------------------
+# Contact dedup / upsert
+# ---------------------------------------------------------------------------
+_CONTACT_MUTABLE_FIELDS = (
+    "company", "person", "phone", "email", "website", "address",
+    "wechat_id", "wechat_qr_url", "whatsapp", "viber", "telegram",
+    "line_id", "signal_phone", "phone_e164",
+)
+
+
+def _merge_messengers(existing_json: str, new_list) -> str:
+    """Merge messenger entries deduped by (platform, handle)."""
+    try:
+        existing = json.loads(existing_json) if existing_json else []
+    except Exception:
+        existing = []
+    if not isinstance(existing, list):
+        existing = []
+    if not isinstance(new_list, list):
+        new_list = []
+    seen = set()
+    merged = []
+    for entry in list(existing) + list(new_list):
+        if not isinstance(entry, dict):
+            continue
+        key = (entry.get("platform", ""), entry.get("handle", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(entry)
+    return json.dumps(merged, ensure_ascii=False)
+
+
+def upsert_contact(c_data: dict, document_uuid: str = None, document_id: int = None,
+                   owner_uuid: str = None, is_shared: int = 0,
+                   source_channel: str = "upload") -> str:
+    """Dedup contact insert. Returns contact uuid.
+
+    Match order:
+      1. phone_e164
+      2. email
+      3. (company AND person) fuzzy (lower+strip)
+    On match: only fill NULL/empty existing fields with new non-null values;
+    append messengers JSON (dedup by platform+handle).
+    """
+    if not isinstance(c_data, dict):
+        c_data = {}
+
+    conn = _conn()
+    existing = None
+
+    phone_e164 = (c_data.get("phone_e164") or "").strip()
+    email = (c_data.get("email") or "").strip()
+    company = (c_data.get("company") or "").strip()
+    person = (c_data.get("person") or "").strip()
+
+    if phone_e164:
+        existing = conn.execute(
+            "SELECT * FROM contacts WHERE phone_e164 = ? LIMIT 1", (phone_e164,)
+        ).fetchone()
+    if not existing and email:
+        existing = conn.execute(
+            "SELECT * FROM contacts WHERE LOWER(TRIM(email)) = LOWER(TRIM(?)) LIMIT 1", (email,)
+        ).fetchone()
+    if not existing and company and person:
+        existing = conn.execute(
+            "SELECT * FROM contacts WHERE LOWER(TRIM(company)) = LOWER(TRIM(?)) "
+            "AND LOWER(TRIM(person)) = LOWER(TRIM(?)) LIMIT 1",
+            (company, person),
+        ).fetchone()
+
+    if existing:
+        contact_uuid = existing["uuid"]
+        existing_d = dict(existing)
+        updates = {}
+        for field in _CONTACT_MUTABLE_FIELDS:
+            new_val = c_data.get(field)
+            if new_val is None or (isinstance(new_val, str) and not new_val.strip()):
+                continue
+            cur_val = existing_d.get(field)
+            if cur_val is None or (isinstance(cur_val, str) and not cur_val.strip()):
+                updates[field] = new_val
+
+        new_messengers = c_data.get("messengers")
+        if new_messengers is not None:
+            merged_json = _merge_messengers(existing_d.get("messengers") or "[]", new_messengers)
+            updates["messengers"] = merged_json
+
+        if updates:
+            # Audit: bump edit_count, set updated_at
+            sets = ", ".join(f"{k} = ?" for k in updates)
+            params = list(updates.values()) + [_now_iso(), contact_uuid]
+            conn.execute(
+                f"UPDATE contacts SET {sets}, updated_at = ?, "
+                "edit_count = COALESCE(edit_count, 0) + 1 WHERE uuid = ?",
+                params,
+            )
+            conn.commit()
+        conn.close()
+        return contact_uuid
+
+    # No match - insert new
+    new_uuid = str(uuid4())
+    messengers_val = c_data.get("messengers")
+    if messengers_val is not None and not isinstance(messengers_val, str):
+        messengers_val = json.dumps(messengers_val, ensure_ascii=False)
+
+    # Look up owner name for cached column
+    owner_name = None
+    if owner_uuid:
+        try:
+            u = conn.execute("SELECT name FROM users WHERE uuid = ?", (owner_uuid,)).fetchone()
+            if u:
+                owner_name = u["name"]
+        except Exception:
+            owner_name = None
+
+    _ins_now = _now_iso()
+    conn.execute(
+        """
+        INSERT INTO contacts (
+            uuid, document_uuid, document_id, folder, source_file,
+            company, person, phone, email, website, address,
+            wechat_id, wechat_qr_url, whatsapp, viber, telegram,
+            line_id, signal_phone, messengers, phone_e164,
+            owner_uuid, is_shared,
+            source_channel, updated_at, edit_count, owner_name
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            new_uuid, document_uuid, document_id,
+            c_data.get("folder", ""), c_data.get("source_file", ""),
+            company, person,
+            c_data.get("phone", "") or "",
+            email,
+            c_data.get("website", "") or "",
+            c_data.get("address", "") or "",
+            c_data.get("wechat_id"), c_data.get("wechat_qr_url"),
+            c_data.get("whatsapp"), c_data.get("viber"), c_data.get("telegram"),
+            c_data.get("line_id"), c_data.get("signal_phone"),
+            messengers_val, phone_e164 or None,
+            owner_uuid, int(bool(is_shared)),
+            source_channel or "upload", _ins_now, 0, owner_name,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return new_uuid
+
+
+# ---------------------------------------------------------------------------
+# WeChat chat map helpers
+# ---------------------------------------------------------------------------
+def wechat_map_get(chat_hash: str):
+    c = _conn()
+    row = c.execute("SELECT * FROM wechat_chat_map WHERE chat_hash = ?", (chat_hash,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+
+def wechat_map_set(chat_hash: str, vendor_company: str, contact_uuid: str = None, notes: str = None):
+    c = _conn()
+    c.execute(
+        """
+        INSERT INTO wechat_chat_map (chat_hash, vendor_company, contact_uuid, notes)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(chat_hash) DO UPDATE SET
+            vendor_company = excluded.vendor_company,
+            contact_uuid = excluded.contact_uuid,
+            notes = excluded.notes
+        """,
+        (chat_hash, vendor_company, contact_uuid, notes),
+    )
+    c.commit()
+    c.close()
+
+
+def wechat_map_list() -> list:
+    c = _conn()
+    rows = c.execute("SELECT * FROM wechat_chat_map ORDER BY created_at DESC").fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def wechat_map_delete(chat_hash: str):
+    c = _conn()
+    c.execute("DELETE FROM wechat_chat_map WHERE chat_hash = ?", (chat_hash,))
+    c.commit()
+    c.close()
+
+
+# ---------------------------------------------------------------------------
+# Phone normalization migration
+# ---------------------------------------------------------------------------
+def migrate_phone_e164(default_region: str = "CN") -> dict:
+    """Iterate existing contacts and populate phone_e164 from `phone` via phonenumbers."""
+    try:
+        import phonenumbers
+    except ImportError:
+        return {"updated": 0, "error": "phonenumbers not installed"}
+
+    c = _conn()
+    rows = c.execute(
+        "SELECT id, phone FROM contacts WHERE (phone_e164 IS NULL OR phone_e164 = '') AND phone IS NOT NULL AND phone != ''"
+    ).fetchall()
+    updated = 0
+    for r in rows:
+        raw = r["phone"]
+        if not raw:
+            continue
+        try:
+            num = phonenumbers.parse(raw, default_region)
+            if not phonenumbers.is_valid_number(num):
+                continue
+            e164 = phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+            c.execute("UPDATE contacts SET phone_e164 = ? WHERE id = ?", (e164, r["id"]))
+            updated += 1
+        except Exception:
+            continue
+    c.commit()
+    c.close()
+    return {"updated": updated}
+
+
+# ---------------------------------------------------------------------------
+# Time-zone helper
+# ---------------------------------------------------------------------------
+def get_docs_by_local_date(date_str: str, tz: str = "Asia/Shanghai") -> list:
+    """Return documents whose `date_taken` falls on `date_str` (YYYY-MM-DD) in the given tz.
+
+    `date_taken` is stored as EXIF format e.g. '2026:04:22 14:33:01' (assumed UTC-naive).
+    We convert the local day window to UTC and compare.
+    """
+    # Tz offset (fallback to fixed Asia/Shanghai +08:00 if zoneinfo absent)
+    try:
+        from zoneinfo import ZoneInfo
+        tzinfo = ZoneInfo(tz)
+    except Exception:
+        tzinfo = timezone(timedelta(hours=8))
+
+    try:
+        local_day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tzinfo)
+    except ValueError:
+        return []
+    local_next = local_day + timedelta(days=1)
+    utc_start = local_day.astimezone(timezone.utc).strftime("%Y:%m:%d %H:%M:%S")
+    utc_end = local_next.astimezone(timezone.utc).strftime("%Y:%m:%d %H:%M:%S")
+
+    c = _conn()
+    rows = c.execute(
+        "SELECT * FROM documents WHERE date_taken IS NOT NULL AND date_taken >= ? AND date_taken < ? ORDER BY date_taken",
+        (utc_start, utc_end),
+    ).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Tenancy-aware query helpers (used by main.py endpoints)
+# ---------------------------------------------------------------------------
+
+def get_documents_visible(user: dict, folder: str = None, limit: int = 500) -> list:
+    c = _conn()
+    where_parts = []
+    params = []
+    if folder:
+        where_parts.append("d.folder = ?")
+        params.append(folder)
+    vc, vp = visibility_clause("d", user)
+    if vc:
+        where_parts.append(vc)
+        params.extend(vp)
+    where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    rows = c.execute(
+        f"SELECT d.*, u.name AS owner_name FROM documents d "
+        f"LEFT JOIN users u ON u.uuid = d.owner_uuid "
+        f"{where_sql} ORDER BY d.folder, d.source_file LIMIT ?",
+        (*params, limit),
+    ).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def get_document_visible(doc_id: int, user: dict):
+    c = _conn()
+    vc, vp = visibility_clause("", user)
+    if vc:
+        row = c.execute(f"SELECT * FROM documents WHERE id = ? AND {vc}", (doc_id, *vp)).fetchone()
+    else:
+        row = c.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+
+def get_contact_visible(uuid: str, user: dict):
+    c = _conn()
+    vc, vp = visibility_clause("", user)
+    if vc:
+        row = c.execute(f"SELECT * FROM contacts WHERE uuid = ? AND {vc}", (uuid, *vp)).fetchone()
+    else:
+        row = c.execute("SELECT * FROM contacts WHERE uuid = ?", (uuid,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+
+def get_product_visible(uuid: str, user: dict):
+    c = _conn()
+    vc, vp = visibility_clause("", user)
+    if vc:
+        row = c.execute(f"SELECT * FROM products WHERE uuid = ? AND {vc}", (uuid, *vp)).fetchone()
+    else:
+        row = c.execute("SELECT * FROM products WHERE uuid = ?", (uuid,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+
+def get_product_by_uuid(uuid: str):
+    c = _conn()
+    row = c.execute("SELECT * FROM products WHERE uuid = ?", (uuid,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+
+def get_contacts_table_visible(user: dict, limit: int = 500) -> list:
+    c = _conn()
+    vc, vp = visibility_clause("ct", user)
+    where_sql = f"WHERE {vc}" if vc else ""
+    rows = c.execute(
+        f"SELECT ct.*, COALESCE(ct.owner_name, u.name) AS owner_name "
+        f"FROM contacts ct LEFT JOIN users u ON u.uuid = ct.owner_uuid "
+        f"{where_sql} ORDER BY ct.company, ct.person LIMIT ?",
+        (*vp, limit),
+    ).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def get_products_table_visible(user: dict, limit: int = 500) -> list:
+    c = _conn()
+    vc, vp = visibility_clause("p", user)
+    where_sql = f"WHERE {vc}" if vc else ""
+    rows = c.execute(
+        f"SELECT p.*, u.name AS owner_name FROM products p "
+        f"LEFT JOIN users u ON u.uuid = p.owner_uuid "
+        f"{where_sql} ORDER BY p.company, p.name LIMIT ?",
+        (*vp, limit),
+    ).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def get_queue_visible(user: dict, batch_id: str = None) -> list:
+    c = _conn()
+    parts = []
+    params = []
+    if batch_id:
+        parts.append("batch_id = ?")
+        params.append(batch_id)
+    if user and user.get("role") not in ("super_admin", "admin"):
+        parts.append("owner_uuid = ?")
+        params.append(user["uuid"])
+    where_sql = ("WHERE " + " AND ".join(parts)) if parts else ""
+    rows = c.execute(f"SELECT * FROM queue {where_sql} ORDER BY id DESC", params).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def get_stats_visible(user: dict) -> dict:
+    c = _conn()
+    vc, vp = visibility_clause("", user)
+    where_sql = f"WHERE {vc}" if vc else ""
+    total = c.execute(f"SELECT COUNT(*) FROM documents {where_sql}", vp).fetchone()[0]
+    folders = c.execute(
+        f"SELECT DISTINCT folder FROM documents {where_sql}", vp
+    ).fetchall()
+    if vc:
+        comp_sql = f"SELECT DISTINCT company FROM documents WHERE {vc} AND company IS NOT NULL AND company != ''"
+    else:
+        comp_sql = "SELECT DISTINCT company FROM documents WHERE company IS NOT NULL AND company != ''"
+    companies = c.execute(comp_sql, vp).fetchall()
+    c.close()
+    return {
+        "total_documents": total,
+        "folders": [r[0] for r in folders],
+        "companies": [r[0] for r in companies],
+    }
+
+
+def export_all_visible(user: dict) -> list:
+    c = _conn()
+    vc, vp = visibility_clause("", user)
+    where_sql = f"WHERE {vc}" if vc else ""
+    rows = c.execute(
+        f"SELECT * FROM documents {where_sql} ORDER BY folder, source_file", vp
+    ).fetchall()
+    c.close()
+    results = []
+    for r in rows:
+        d = dict(r)
+        for field in ("products", "contact", "key_info"):
+            if d.get(field):
+                try:
+                    d[field] = json.loads(d[field])
+                except Exception:
+                    pass
+        results.append(d)
+    return results
+
+
+def get_all_contact_records_visible(user: dict) -> list:
+    c = _conn()
+    vc, vp = visibility_clause("", user)
+    where_sql = f"WHERE {vc}" if vc else ""
+    rows = c.execute(f"SELECT * FROM contacts {where_sql}", vp).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+# ── Share toggle helpers ────────────────────────────────────────
+
+def set_document_shared(doc_id: int, is_shared: bool) -> int:
+    c = _conn()
+    n = c.execute("UPDATE documents SET is_shared = ? WHERE id = ?",
+                  (1 if is_shared else 0, doc_id)).rowcount
+    c.commit()
+    c.close()
+    return n
+
+
+def set_contact_shared(uuid: str, is_shared: bool) -> int:
+    c = _conn()
+    n = c.execute("UPDATE contacts SET is_shared = ? WHERE uuid = ?",
+                  (1 if is_shared else 0, uuid)).rowcount
+    c.commit()
+    c.close()
+    return n
+
+
+def set_product_shared(uuid: str, is_shared: bool) -> int:
+    c = _conn()
+    n = c.execute("UPDATE products SET is_shared = ? WHERE uuid = ?",
+                  (1 if is_shared else 0, uuid)).rowcount
+    c.commit()
+    c.close()
+    return n
+
+
+def delete_contact(uuid: str) -> int:
+    c = _conn()
+    n = c.execute("DELETE FROM contacts WHERE uuid = ?", (uuid,)).rowcount
+    c.commit()
+    c.close()
+    return n
+
+
+def delete_product(uuid: str) -> int:
+    c = _conn()
+    n = c.execute("DELETE FROM products WHERE uuid = ?", (uuid,)).rowcount
+    c.commit()
+    c.close()
+    return n
 
 
 init_db()
