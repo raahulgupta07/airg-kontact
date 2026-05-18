@@ -13,6 +13,14 @@
   let showTerminal = $state(false);
   let expandedBatch = $state(null);
   let expandedData = $state([]);
+
+  // Lightbox
+  let lightboxDoc = $state(null);
+  function openLightbox(doc) { lightboxDoc = doc; }
+  function closeLightbox() { lightboxDoc = null; }
+  function onLightboxKey(e) {
+    if (e.key === 'Escape') closeLightbox();
+  }
   let toast = $state(null);
 
   const api = {
@@ -201,7 +209,12 @@
               {:else}
                 {#each expandedData as doc, i}
                   <div class="q-doc-row">
-                    <div class="q-doc-thumb">
+                    <button
+                      type="button"
+                      class="q-doc-thumb"
+                      onclick={() => openLightbox(doc)}
+                      aria-label={`Open ${doc.source_file}`}
+                    >
                       <div class="q-thumb-skeleton"></div>
                       <img
                         src={`/api/image/${doc.folder}/${doc.source_file}`}
@@ -210,7 +223,7 @@
                         onload={(e) => { e.target.style.opacity = '1'; e.target.previousElementSibling.style.display = 'none'; }}
                         onerror={(e) => { e.target.style.display = 'none'; e.target.previousElementSibling.style.background = 'var(--surface-2)'; }}
                       />
-                    </div>
+                    </button>
                     <div class="q-doc-meta">
                       <div class="q-doc-top">
                         <span class="q-doc-filename">{doc.source_file}</span>
@@ -269,6 +282,61 @@
   {/if}
 </div>
 
+<svelte:window onkeydown={onLightboxKey} />
+
+{#if lightboxDoc}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="lb-backdrop" onclick={closeLightbox}>
+    <div class="lb-modal" onclick={(e) => e.stopPropagation()}>
+      <button class="lb-close" onclick={closeLightbox} aria-label="Close">×</button>
+      <img
+        class="lb-img"
+        src={`/api/image/${lightboxDoc.folder}/${lightboxDoc.source_file}`}
+        alt={lightboxDoc.source_file}
+      />
+      <div class="lb-meta">
+        <h3 class="lb-title">{lightboxDoc.source_file}</h3>
+        <div class="lb-row">
+          {#if lightboxDoc.image_type}<span class="chip">{lightboxDoc.image_type}</span>{/if}
+          {#if lightboxDoc.company}<span class="lb-tag">{lightboxDoc.company}</span>{/if}
+          {#if lightboxDoc.trade_show}<span class="lb-tag lb-show">{lightboxDoc.trade_show}</span>{/if}
+        </div>
+        {#if lightboxDoc.title}<p class="lb-desc">{lightboxDoc.title}</p>{/if}
+        {#if lightboxDoc.contact}
+          <div class="lb-contact">
+            {#if lightboxDoc.contact.person}<div><b>{lightboxDoc.contact.person}</b></div>{/if}
+            {#if lightboxDoc.contact.phone}<div>📞 {lightboxDoc.contact.phone}</div>{/if}
+            {#if lightboxDoc.contact.email}<div>✉ {lightboxDoc.contact.email}</div>{/if}
+            {#if lightboxDoc.contact.address}<div>📍 {lightboxDoc.contact.address}</div>{/if}
+            {#if lightboxDoc.contact.website}<div>🌐 {lightboxDoc.contact.website}</div>{/if}
+          </div>
+        {/if}
+        {#if lightboxDoc.products && lightboxDoc.products.length}
+          <div class="lb-products">
+            <div class="lb-section-h">Products ({lightboxDoc.products.length})</div>
+            {#each lightboxDoc.products.slice(0, 8) as p}
+              <div class="lb-prod">
+                {typeof p === 'string' ? p : (p.name || p.product_name || '')}
+                {#if p && typeof p === 'object' && p.price}<span class="lb-price">{p.price}</span>{/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+        {#if lightboxDoc.gps_lat}
+          <div class="lb-meta-row">GPS: {lightboxDoc.gps_lat}, {lightboxDoc.gps_lng} {#if lightboxDoc.city}— {lightboxDoc.city}, {lightboxDoc.country}{/if}</div>
+        {/if}
+        {#if lightboxDoc.camera_make}
+          <div class="lb-meta-row">Camera: {lightboxDoc.camera_make} {lightboxDoc.camera_model || ''}</div>
+        {/if}
+        {#if lightboxDoc.date_taken}
+          <div class="lb-meta-row">Taken: {lightboxDoc.date_taken}</div>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   .q-page { width:100%; padding:16px; font-family: var(--font-sans); max-width: 920px; margin: 0 auto; }
 
@@ -316,7 +384,8 @@
   .q-expand-empty { font-size:13px; color:var(--text-muted); padding:8px 0; }
 
   .q-doc-row { display:flex; gap:12px; align-items:flex-start; padding:10px 0; }
-  .q-doc-thumb { flex-shrink:0; width:56px; height:56px; overflow:hidden; border:1px solid var(--border); border-radius: var(--r-sm); position:relative; }
+  .q-doc-thumb { flex-shrink:0; width:56px; height:56px; overflow:hidden; border:1px solid var(--border); border-radius: var(--r-sm); position:relative; padding:0; background:none; cursor:zoom-in; transition: border-color 0.15s, transform 0.15s; }
+  .q-doc-thumb:hover { border-color: var(--accent); transform: scale(1.04); }
   .q-doc-thumb img { width:100%; height:100%; object-fit:cover; display:block; opacity:0; transition:opacity 0.2s; position:relative; z-index:1; }
   .q-thumb-skeleton { position:absolute; inset:0; background:var(--surface-2); animation:q-pulse 1.2s ease-in-out infinite; z-index:0; }
   @keyframes q-pulse { 0%,100% { opacity:0.4; } 50% { opacity:1; } }
@@ -352,5 +421,73 @@
     .q-row-right { flex-wrap:wrap; justify-content: space-between; }
     .q-doc-row { flex-direction:column; gap:6px; }
     .q-doc-thumb { width:48px; height:48px; }
+  }
+
+  /* Lightbox */
+  .lb-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.72);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 200; padding: 16px;
+    animation: lb-fade 0.18s ease;
+  }
+  @keyframes lb-fade { from { opacity: 0; } to { opacity: 1; } }
+  .lb-modal {
+    background: var(--surface);
+    border-radius: var(--r-lg, 14px);
+    max-width: 960px; width: 100%; max-height: 92vh;
+    display: grid; grid-template-columns: minmax(280px, 1.2fr) minmax(280px, 1fr);
+    overflow: hidden;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.5);
+    position: relative;
+  }
+  .lb-img {
+    width: 100%; height: 100%; max-height: 92vh;
+    object-fit: contain; background: #000;
+    display: block;
+  }
+  .lb-close {
+    position: absolute; top: 10px; right: 10px;
+    background: rgba(0,0,0,0.55); color: #fff;
+    border: none; width: 36px; height: 36px; border-radius: 50%;
+    font-size: 22px; line-height: 1; cursor: pointer; z-index: 2;
+  }
+  .lb-meta {
+    padding: 18px 22px; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 10px;
+    font-size: 14px; color: var(--text);
+  }
+  .lb-title {
+    font-size: 16px; font-weight: 600; margin: 0;
+    word-break: break-all;
+  }
+  .lb-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .lb-tag {
+    font-size: 12px; padding: 3px 8px;
+    background: var(--surface-2, var(--surface));
+    border: 1px solid var(--border);
+    border-radius: 999px; color: var(--text-muted);
+  }
+  .lb-show { background: var(--accent-soft, rgba(201, 100, 66, 0.12)); color: var(--accent); border-color: var(--accent); }
+  .lb-desc { margin: 0; color: var(--text-muted); }
+  .lb-contact {
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 8px 10px;
+    background: var(--surface-2, rgba(0,0,0,0.03));
+    border-radius: var(--r-md, 8px);
+    font-size: 13px;
+  }
+  .lb-section-h {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    color: var(--text-muted); letter-spacing: 0.04em; margin-bottom: 4px;
+  }
+  .lb-products { display: flex; flex-direction: column; gap: 4px; }
+  .lb-prod { font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
+  .lb-price { color: var(--accent); font-weight: 600; }
+  .lb-meta-row { font-size: 12px; color: var(--text-muted); }
+
+  @media (max-width: 720px) {
+    .lb-modal { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    .lb-img { max-height: 50vh; }
   }
 </style>
