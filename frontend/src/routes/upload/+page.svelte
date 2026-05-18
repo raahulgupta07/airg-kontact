@@ -159,16 +159,21 @@
 
   function handleFiles(event) {
     const selected = Array.from(event.target.files ?? []);
+    if (!selected.length) return;
     files = [...files, ...selected];
     checkImageQuality(selected);
+    // Auto-submit: as soon as a file is picked, fire upload + go to queue
+    queueMicrotask(() => { if (!uploading || uploading === 'idle') upload(); });
   }
 
   function handleDrop(event) {
     event.preventDefault();
     dragOver = false;
     const dropped = Array.from(event.dataTransfer.files).filter(f => f.type.startsWith('image/') || f.type === 'application/pdf');
+    if (!dropped.length) return;
     files = [...files, ...dropped];
     checkImageQuality(dropped);
+    queueMicrotask(() => { if (!uploading || uploading === 'idle') upload(); });
   }
 
   function handleDragOver(event) {
@@ -256,6 +261,10 @@
       });
       result = res;
       uploading = 'done';
+      // Auto-redirect to queue after brief confirmation so user sees progress
+      if (res && res.queued && res.queued > 0) {
+        setTimeout(() => goto('/queue'), 900);
+      }
     } catch (err) {
       console.error('Upload failed:', err);
       uploadError = err instanceof Error ? err.message : 'Upload failed. Please try again.';
