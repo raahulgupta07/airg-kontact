@@ -35,13 +35,25 @@ from pydantic import BaseModel
 app = FastAPI(title="KONTACT — Catalog Vision RAG")
 
 # ─── Rate limiting (slowapi) ─────────────────────────────────────────
+# Per-user keying for authenticated routes so 10-user teams behind one
+# NAT IP don't share a single bucket. Falls back to IP when no session.
 RATE_LIMIT_ENABLED = (os.getenv("RATE_LIMIT_ENABLED") or "true").lower() == "true"
 try:
     from slowapi import Limiter, _rate_limit_exceeded_handler
     from slowapi.util import get_remote_address
     from slowapi.errors import RateLimitExceeded
-    limiter = Limiter(key_func=get_remote_address, enabled=RATE_LIMIT_ENABLED,
-                      default_limits=["600/hour"])
+    from auth import verify_token as _verify_token
+
+    def _user_or_ip_key(request: Request) -> str:
+        tok = request.cookies.get("kontact_session")
+        if tok:
+            payload = _verify_token(tok)
+            if payload and payload.get("uuid"):
+                return f"user:{payload['uuid']}"
+        return f"ip:{get_remote_address(request)}"
+
+    limiter = Limiter(key_func=_user_or_ip_key, enabled=RATE_LIMIT_ENABLED,
+                      default_limits=["1200/hour"])
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 except Exception as _e:
@@ -261,7 +273,7 @@ async def users_delete(target_uuid: str, user=Depends(require_role("admin", "sup
 # ─── UPLOAD (just saves to queue, no processing) ───
 
 @app.post("/api/upload")
-@(limiter.limit("30/minute") if limiter else (lambda f: f))
+@(limiter.limit("60/minute") if limiter else (lambda f: f))
 async def upload_images(request: Request, files: list[UploadFile] = File(...), batch_id: str = Form(None), bg: BackgroundTasks = BackgroundTasks(), user=Depends(current_user)):
     if not batch_id:
         batch_id = str(uuid.uuid4())[:8]
@@ -757,7 +769,7 @@ def index_all(user=Depends(current_user)):
 # ─── CHAT ───
 
 @app.post("/api/chat")
-@(limiter.limit("60/minute") if limiter else (lambda f: f))
+@(limiter.limit("120/minute") if limiter else (lambda f: f))
 async def chat_endpoint(req: ChatRequest, request: Request, user=Depends(current_user)):
     session_id = req.session_id or str(uuid.uuid4())[:8]
     result = await chat.ask(req.question, session_id=session_id, user=user)
