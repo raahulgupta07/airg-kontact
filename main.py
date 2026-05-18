@@ -451,7 +451,7 @@ def queue_status(batch_id: str = None, user=Depends(current_user)):
 
 @app.get("/api/queue/batches")
 def queue_batches(user=Depends(current_user)):
-    return db.queue_batches()
+    return db.queue_batches(user=user)
 
 
 @app.get("/api/queue/errors")

@@ -1359,16 +1359,21 @@ def delete_batch(batch_id: str) -> int:
     return queue_deleted + doc_deleted
 
 
-def queue_batches() -> list:
+def queue_batches(user: dict = None) -> list:
     c = _conn()
-    rows = c.execute("""
+    where = ""
+    params: tuple = ()
+    if user and user.get("role") not in ("super_admin", "admin"):
+        where = "WHERE owner_uuid = ?"
+        params = (user["uuid"],)
+    rows = c.execute(f"""
         SELECT batch_id, COUNT(*) as total,
                SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pending,
                SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) as done,
                SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) as errors,
                MIN(created_at) as created, MAX(processed_at) as last_processed
-        FROM queue GROUP BY batch_id ORDER BY created DESC
-    """).fetchall()
+        FROM queue {where} GROUP BY batch_id ORDER BY created DESC
+    """, params).fetchall()
     c.close()
     return [dict(r) for r in rows]
 
