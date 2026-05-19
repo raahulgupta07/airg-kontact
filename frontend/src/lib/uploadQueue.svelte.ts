@@ -24,6 +24,17 @@ const MAX_PARALLEL = 2;
 const MAX_DIM = 2000;
 const JPEG_QUALITY = 0.85;
 
+// crypto.randomUUID() requires HTTPS / localhost (secure context).
+// LAN IPs over http (192.168.x.x) throw. Use fallback.
+function makeId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch {}
+  return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+}
+
 class UploadQueueState {
   jobs: UploadJob[] = $state([]);
   trayOpen: boolean = $state(false);
@@ -73,7 +84,7 @@ class UploadQueueState {
     const ts = tradeShow?.trim() || undefined;
     for (const f of files) {
       const job: UploadJob = {
-        id: crypto.randomUUID(),
+        id: makeId(),
         file: f,
         name: f.name || 'upload',
         size: f.size || 0,
