@@ -6,9 +6,59 @@
   let lbIdx = $state(0);
   let selected = $state<Record<string, boolean>>({});
   let selectMode = $state(false);
+  let groupMode = $state<'none' | 'category' | 'company' | 'show'>('none');
 
   function imageDocs() {
     return documents.filter((d: any) => d.source_file && d.folder);
+  }
+
+  function docCategory(d: any): string {
+    let prods = d.products;
+    if (typeof prods === 'string') {
+      try { prods = JSON.parse(prods); } catch { prods = []; }
+    }
+    if (Array.isArray(prods) && prods.length > 0) {
+      const c = (prods[0] && prods[0].category) ? String(prods[0].category).trim() : '';
+      if (c) return c;
+    }
+    return d.image_type || 'Uncategorized';
+  }
+
+  function groupKey(d: any): string {
+    if (groupMode === 'category') return docCategory(d);
+    if (groupMode === 'company') return (d.company || '').trim() || 'Unknown';
+    if (groupMode === 'show') return (d.trade_show || '').trim() || 'No trade show';
+    return '';
+  }
+
+  function groupedDocs(): Array<{ key: string; docs: any[] }> {
+    const list = imageDocs();
+    if (groupMode === 'none') return [{ key: '', docs: list }];
+    const map: Record<string, any[]> = {};
+    for (const d of list) {
+      const k = groupKey(d);
+      (map[k] ||= []).push(d);
+    }
+    return Object.keys(map).sort().map(k => ({ key: k, docs: map[k] }));
+  }
+
+  let aiBusy = $state(false);
+  async function autoCategorize() {
+    if (aiBusy) return;
+    aiBusy = true;
+    try {
+      const r = await fetch('/api/categories/auto', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (r.ok) {
+        groupMode = 'category';
+        setTimeout(() => location.reload(), 800);
+      }
+    } finally {
+      aiBusy = false;
+    }
   }
 
   function openLightbox(doc: any, idx: number) {
@@ -79,6 +129,15 @@
   <div class="gallery-head">
     <h2>Image gallery <span class="muted">({imageDocs().length})</span></h2>
     <div class="actions">
+      <div class="group-pills" role="tablist" aria-label="Group by">
+        <button class="gp" class:active={groupMode === 'none'} onclick={() => groupMode = 'none'}>All</button>
+        <button class="gp" class:active={groupMode === 'category'} onclick={() => groupMode = 'category'}>By category</button>
+        <button class="gp" class:active={groupMode === 'company'} onclick={() => groupMode = 'company'}>By company</button>
+        <button class="gp" class:active={groupMode === 'show'} onclick={() => groupMode = 'show'}>By show</button>
+      </div>
+      <button class="btn-ai xs" onclick={autoCategorize} disabled={aiBusy} title="Use AI to fill missing categories">
+        {aiBusy ? '⏳' : '✨ AI categorize'}
+      </button>
       <button class="btn-ghost xs" onclick={() => { selectMode = !selectMode; if (!selectMode) clearSelection(); }}>
         {selectMode ? 'Done' : 'Select'}
       </button>
@@ -95,22 +154,36 @@
   {#if documents.length === 0}
     <p class="muted">Loading images…</p>
   {:else}
-    <div class="gallery-grid">
-      {#each imageDocs() as doc, i (doc.uuid || doc.source_file)}
-        <button
-          type="button"
-          class="gallery-thumb"
-          class:selected={isSelected(doc)}
-          onclick={() => openLightbox(doc, i)}
-          title={doc.source_file}
-        >
-          <img src="{API}/api/image/{doc.folder}/{doc.source_file}" alt={doc.source_file} loading="lazy" />
-          {#if selectMode}
-            <span class="check" class:on={isSelected(doc)}>{isSelected(doc) ? '✓' : ''}</span>
-          {/if}
-        </button>
-      {/each}
-    </div>
+    {#each groupedDocs() as group (group.key)}
+      {#if groupMode !== 'none'}
+        <div class="group-header">
+          <span class="group-title">{group.key}</span>
+          <span class="group-count">{group.docs.length}</span>
+        </div>
+      {/if}
+      <div class="gallery-grid">
+        {#each group.docs as doc, i (doc.uuid || doc.source_file)}
+          <button
+            type="button"
+            class="gallery-thumb"
+            class:selected={isSelected(doc)}
+            onclick={() => openLightbox(doc, imageDocs().indexOf(doc))}
+            title={doc.source_file}
+          >
+            <img src="{API}/api/image/{doc.folder}/{doc.source_file}" alt={doc.source_file} loading="lazy" />
+            {#if groupMode === 'none'}
+              {@const cat = docCategory(doc)}
+              {#if cat && cat !== 'Uncategorized'}
+                <span class="cat-tag">{cat}</span>
+              {/if}
+            {/if}
+            {#if selectMode}
+              <span class="check" class:on={isSelected(doc)}>{isSelected(doc) ? '✓' : ''}</span>
+            {/if}
+          </button>
+        {/each}
+      </div>
+    {/each}
   {/if}
 </div>
 
@@ -142,9 +215,62 @@
 
 <style>
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); padding: 16px; }
-  .gallery-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .gallery-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
   .gallery-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
-  .actions { margin-left: auto; display: flex; gap: 6px; }
+  .actions { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .group-pills {
+    display: inline-flex;
+    background: var(--surface-2, rgba(0,0,0,0.04));
+    border-radius: 999px;
+    padding: 3px;
+    gap: 0;
+  }
+  .gp {
+    border: none; background: transparent;
+    padding: 4px 10px;
+    font-size: 12px;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-radius: 999px;
+    font-family: inherit;
+    transition: background 0.12s, color 0.12s;
+  }
+  .gp:hover { color: var(--text); }
+  .gp.active { background: var(--accent); color: white; font-weight: 600; }
+  .btn-ai.xs {
+    background: var(--accent);
+    color: white;
+    border: 1px solid var(--accent);
+    padding: 5px 10px;
+    border-radius: var(--r-sm);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .btn-ai.xs:disabled { opacity: 0.6; cursor: not-allowed; }
+  .group-header {
+    display: flex; align-items: center; gap: 8px;
+    margin: 14px 0 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .group-title { font-weight: 600; font-size: 14px; color: var(--text); }
+  .group-count {
+    background: var(--accent-soft, rgba(201,100,66,0.1));
+    color: var(--accent);
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .cat-tag {
+    position: absolute; bottom: 4px; left: 4px; right: 4px;
+    background: rgba(0,0,0,0.75); color: white;
+    padding: 2px 6px; border-radius: var(--r-sm);
+    font-size: 10px; font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .muted { color: var(--text-muted); font-size: 13px; font-weight: 400; }
 
   .gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; }
