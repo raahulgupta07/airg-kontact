@@ -416,46 +416,20 @@
 </svelte:head>
 
 <div class="upload-page">
-  <header class="page-head">
-    <h1 class="page-title">Upload</h1>
-    <p class="page-sub">Snap or drop catalog pages, PDFs, or images.</p>
-    <label class="show-input">
-      <span>Trade show / batch label (optional)</span>
-      <input
-        type="text"
-        placeholder="e.g. Canton Fair 2026, CES 2026"
-        bind:value={tradeShow}
-        maxlength="80"
-      />
-    </label>
-    <label class="fast-toggle">
-      <input type="checkbox" bind:checked={fastMode} />
-      <span class="fast-label">
-        <strong>Fast mode</strong>
-        <em>compress to 2000px before sending (~95% faster on phone)</em>
-      </span>
-    </label>
-  </header>
+  <h1 class="page-title-mini">Upload</h1>
 
   {#if !online}
-    <div class="banner banner-warn">
-      Offline — {files.length} file{files.length === 1 ? '' : 's'} ready. Reconnect to upload.
-    </div>
+    <div class="banner banner-warn">Offline — reconnect to send</div>
   {/if}
-
   {#if uploadQueue.hasActive}
-    <div class="upload-hint">
-      <span class="dot"></span>
-      {uploadQueue.activeCount} uploading in background · keep adding more
+    <div class="upload-hint"><span class="dot"></span>{uploadQueue.activeCount} uploading in background</div>
+  {/if}
+  {#if uploadError}
+    <div class="banner banner-error">
+      <span>{uploadError}</span>
+      <button class="banner-dismiss" onclick={() => uploadError = ''} aria-label="dismiss">&times;</button>
     </div>
   {/if}
-
-  {#if uploadError}
-      <div class="banner banner-error">
-        <span>{uploadError}</span>
-        <button class="banner-dismiss" onclick={() => uploadError = ''} aria-label="dismiss">&times;</button>
-      </div>
-    {/if}
 
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
@@ -474,18 +448,35 @@
         <button class="big-btn" onclick={() => fileInput.click()} type="button">
           <span class="big-btn-ico">&#128190;</span>
           <span class="big-btn-label">Upload</span>
-          <span class="big-btn-sub">Photos or files (PDF, JPG, PNG, HEIC)</span>
+          <span class="big-btn-sub">Photos or PDF</span>
         </button>
       </div>
+    </div>
+
+    <details class="upload-options">
+      <summary>Options</summary>
+      <label class="show-input">
+        <span>Trade show / batch label</span>
+        <input
+          type="text"
+          placeholder="e.g. Canton Fair 2026"
+          bind:value={tradeShow}
+          maxlength="80"
+        />
+      </label>
+      <label class="fast-toggle">
+        <input type="checkbox" bind:checked={fastMode} />
+        <span class="fast-label">
+          <strong>Fast mode</strong>
+          <em>compress before sending</em>
+        </span>
+      </label>
       {#if gettingGeo}
         <p class="geo-hint">&#128205; Getting location…</p>
       {:else if uploadGeo?.lat}
         <p class="geo-hint">&#128205; Location captured (±{Math.round(uploadGeo.accuracy)}m)</p>
-      {:else if uploadAttempted}
-        <p class="geo-hint muted">&#128205; Location unavailable — EXIF will be used if present</p>
       {/if}
-      <p class="drop-hint-row">Drag files anywhere → desktop</p>
-    </div>
+    </details>
 
     <input
       bind:this={cameraInput}
@@ -556,11 +547,42 @@
     font-family: var(--font-sans);
     max-width: 640px;
     margin: 0 auto;
-    padding: 16px 16px 32px;
+    padding: 8px 12px 24px;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 10px;
   }
+  .page-title-mini {
+    font-size: 17px;
+    font-weight: 600;
+    margin: 0;
+    color: var(--text);
+  }
+  .upload-options {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    padding: 8px 12px;
+  }
+  .upload-options summary {
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-muted);
+    list-style: none;
+    font-weight: 500;
+    padding: 4px 0;
+  }
+  .upload-options summary::-webkit-details-marker { display: none; }
+  .upload-options summary::before {
+    content: '▸';
+    margin-right: 6px;
+    transition: transform 0.15s;
+    display: inline-block;
+  }
+  .upload-options[open] summary::before {
+    transform: rotate(90deg);
+  }
+  .upload-options > * + * { margin-top: 8px; }
 
   .page-head { margin-bottom: 4px; }
   .page-title { font-size: 24px; font-weight: 600; color: var(--text); margin: 0; letter-spacing: 0; }
@@ -648,21 +670,23 @@
 
   .two-btn-row {
     display: flex;
-    gap: 12px;
+    gap: 10px;
     width: 100%;
     max-width: 520px;
     margin: 0 auto;
   }
   @media (max-width: 520px) {
-    .two-btn-row { flex-direction: column; }
+    .two-btn-row { flex-direction: row; gap: 8px; }
   }
   .big-btn {
     flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 6px;
-    padding: 24px 16px;
+    justify-content: center;
+    gap: 4px;
+    padding: 14px 8px;
+    min-height: 110px;
     border: 1px solid var(--border);
     border-radius: var(--r-lg);
     background: var(--surface);
@@ -682,9 +706,9 @@
     color: white;
   }
   .big-btn.primary:hover { background: var(--accent); filter: brightness(1.05); }
-  .big-btn-ico { font-size: 36px; line-height: 1; }
-  .big-btn-label { font-size: 16px; font-weight: 600; }
-  .big-btn-sub { font-size: 12px; opacity: 0.75; }
+  .big-btn-ico { font-size: 28px; line-height: 1; }
+  .big-btn-label { font-size: 14px; font-weight: 600; }
+  .big-btn-sub { font-size: 11px; opacity: 0.75; }
 
   .hero-zone {
     display: flex;
@@ -694,7 +718,7 @@
     border: 2px dashed var(--border-strong);
     border-radius: var(--r-lg);
     background: var(--surface);
-    padding: 32px 20px 20px;
+    padding: 12px;
     text-align: center;
     transition: background 0.15s, border-color 0.15s;
   }
