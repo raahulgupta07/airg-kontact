@@ -220,6 +220,16 @@
   let docs = $state([]);
   let filtered = $state([]);
   let expandedId = $state(null);
+  // Lightbox for data card thumbnails
+  let lightboxDoc = $state(null);
+  function openImageLightbox(doc, e) {
+    if (e) { e.stopPropagation(); e.preventDefault(); }
+    lightboxDoc = doc;
+  }
+  function closeLightbox() { lightboxDoc = null; }
+  function onLightboxKey(e) {
+    if (e.key === 'Escape') closeLightbox();
+  }
   let loading = $state(true);
 
   let folderFilter = $state('All');
@@ -432,8 +442,8 @@
         <span class="head-count">{filtered.length} of {docs.length} documents</span>
       {/if}
     </div>
-    {#if activeTab === 'cards'}
-      <div class="head-right">
+    <div class="head-right">
+      {#if activeTab === 'cards'}
         <select class="input sort-select" onchange={onSortChange} value={sortOption}>
           <option value="newest">Newest first</option>
           <option value="oldest">Oldest first</option>
@@ -441,8 +451,11 @@
           <option value="company">By company</option>
           <option value="folder">By folder</option>
         </select>
-      </div>
-    {/if}
+      {/if}
+      <a class="xl-btn" href={`/api/export/xlsx?tab=${activeTab}`} title="Download as Excel">
+        ⬇ Excel
+      </a>
+    </div>
   </header>
 
   <!-- TAB STRIP (grouped) -->
@@ -500,7 +513,16 @@
           <div class="card doc-card" class:expanded={expandedId === docId}>
             <button class="card-header" onclick={() => toggleExpand(docId)}>
               <div class="card-header-row">
-                <img src={`/api/image/${doc.folder}/${doc.source_file}`} alt={doc.source_file} class="card-thumb" loading="lazy" onerror={(e) => e.target.style.display='none'} />
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <img
+                  src={`/api/image/${doc.folder}/${doc.source_file}`}
+                  alt={doc.source_file}
+                  class="card-thumb clickable"
+                  loading="lazy"
+                  onclick={(e) => openImageLightbox(doc, e)}
+                  onerror={(e) => e.target.style.display='none'}
+                />
                 <div class="card-header-info">
                   <div class="card-top-row">
                     <span class="chip chip-accent">{doc.image_type || 'unknown'}</span>
@@ -783,7 +805,83 @@
   </div>
 {/if}
 
+<svelte:window onkeydown={onLightboxKey} />
+{#if lightboxDoc}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="img-lb-backdrop" onclick={closeLightbox}>
+    <div class="img-lb-modal" onclick={(e) => e.stopPropagation()}>
+      <button class="img-lb-close" onclick={closeLightbox} aria-label="Close">×</button>
+      <img class="img-lb-img" src={`/api/image/${lightboxDoc.folder}/${lightboxDoc.source_file}`} alt={lightboxDoc.source_file} />
+      <div class="img-lb-foot">
+        <span class="img-lb-name">{lightboxDoc.source_file}</span>
+        <a class="img-lb-dl" href={`/api/image/${lightboxDoc.folder}/${lightboxDoc.source_file}`} download={lightboxDoc.source_file}>Download</a>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
+  .card-thumb.clickable { cursor: zoom-in; }
+  .card-thumb.clickable:hover { box-shadow: 0 0 0 2px var(--accent); }
+  .xl-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 12px;
+    background: var(--accent);
+    color: white;
+    text-decoration: none;
+    border-radius: var(--r-md);
+    font-size: 13px;
+    font-weight: 600;
+    border: 1px solid var(--accent);
+  }
+  .xl-btn:hover { filter: brightness(1.05); }
+  .head-right { display: flex; gap: 8px; align-items: center; }
+
+  .img-lb-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.78);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 250; padding: 16px;
+  }
+  .img-lb-modal {
+    position: relative;
+    background: var(--surface);
+    border-radius: var(--r-lg);
+    overflow: hidden;
+    max-width: 95vw;
+    max-height: 95vh;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+    display: flex; flex-direction: column;
+  }
+  .img-lb-img {
+    max-width: 95vw;
+    max-height: calc(95vh - 60px);
+    object-fit: contain;
+    background: #000;
+    display: block;
+  }
+  .img-lb-close {
+    position: absolute; top: 8px; right: 8px;
+    width: 36px; height: 36px;
+    background: rgba(0,0,0,0.55);
+    color: white; border: none; border-radius: 50%;
+    font-size: 22px; cursor: pointer; z-index: 3;
+  }
+  .img-lb-foot {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+  }
+  .img-lb-name { flex: 1; font-size: 13px; word-break: break-all; }
+  .img-lb-dl {
+    background: var(--accent); color: white;
+    padding: 6px 14px; border-radius: var(--r-sm);
+    text-decoration: none; font-size: 12px; font-weight: 600;
+  }
+
   .page {
     max-width: 1100px;
     margin: 0 auto;

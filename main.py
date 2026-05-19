@@ -1199,18 +1199,39 @@ def dashboard(user=Depends(current_user)):
 
 
 @app.get("/api/export/xlsx")
-def export_xlsx(user=Depends(current_user)):
+def export_xlsx(tab: str = "all", user=Depends(current_user)):
+    """Full Excel export. Always emits all sheets so user gets every tab in one file."""
     from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
     data = db.export_all_visible(user)
     if not data:
         raise HTTPException(404, "No data")
 
     wb = Workbook()
+    bold = Font(bold=True)
 
-    # Sheet 1: Products
-    ws_prod = wb.active
-    ws_prod.title = "Products"
-    prod_headers = ["company", "product_name", "model", "specs", "category", "price", "folder", "source_file"]
+    def style_header(ws):
+        for cell in ws[1]:
+            cell.font = bold
+        ws.freeze_panes = "A2"
+
+    # Sheet 1: Documents (every catalog page / image)
+    ws_doc = wb.active
+    ws_doc.title = "Documents"
+    doc_headers = ["uuid", "folder", "source_file", "image_type", "company", "title",
+                   "trade_show", "owner_name", "created_at",
+                   "gps_lat", "gps_lng", "country", "city",
+                   "camera_make", "camera_model", "date_taken",
+                   "is_blurry", "blur_score", "near_dup_of"]
+    ws_doc.append(doc_headers)
+    for row in data:
+        ws_doc.append([row.get(h, "") for h in doc_headers])
+    style_header(ws_doc)
+
+    # Sheet 2: Products
+    ws_prod = wb.create_sheet("Products")
+    prod_headers = ["company", "product_name", "model", "specs", "category", "price",
+                    "currency", "price_amount", "folder", "source_file"]
     ws_prod.append(prod_headers)
     for row in data:
         prods = row.get("products", [])
@@ -1224,6 +1245,11 @@ def export_xlsx(user=Depends(current_user)):
         for p in prods:
             if not isinstance(p, dict):
                 continue
+            try:
+                from pipeline.pricing import parse_price as _pp
+                ccy, amt = _pp(str(p.get("price", "")))
+            except Exception:
+                ccy, amt = None, None
             ws_prod.append([
                 p.get("company", "") or row.get("company", ""),
                 p.get("product_name", "") or p.get("name", ""),
@@ -1231,19 +1257,115 @@ def export_xlsx(user=Depends(current_user)):
                 p.get("specs", "") if isinstance(p.get("specs"), str) else json.dumps(p.get("specs", ""), ensure_ascii=False),
                 p.get("category", ""),
                 p.get("price", ""),
+                ccy or "",
+                amt if amt is not None else "",
                 row.get("folder", ""),
                 row.get("source_file", ""),
             ])
+    style_header(ws_prod)
 
-    # Sheet 2: Contacts (filtered by visibility — uses normalized contacts table)
+    # Sheet 3: Contacts
     ws_cont = wb.create_sheet("Contacts")
-    cont_headers = ["company", "person", "phone", "email", "website", "address", "folder"]
+    cont_headers = ["company", "person", "phone", "phone_e164", "email", "website", "address",
+                    "whatsapp", "wechat_qr_url", "telegram", "viber", "line_id", "signal_phone",
+                    "folder", "source_file"]
     ws_cont.append(cont_headers)
     contacts = db.get_all_contact_records_visible(user)
     for ct in contacts:
         ws_cont.append([ct.get(h, "") for h in cont_headers])
+    style_header(ws_cont)
 
-    # Sheet 3: Summary
+    # Sheet 4: Companies (aggregated)
+    ws_co = wb.create_sheet("Companies")
+    co_headers = ["company", "documents", "products", "contacts", "countries"]
+    ws_co.append(co_headers)
+    co_map: dict = {}
+    for row in data:
+        comp = (row.get("company") or "").strip() or "Unknown"
+        info = co_map.setdefault(comp, {"docs": 0, "prods": 0, "contacts": 0, "countries": set()})
+        info["docs"] += 1
+        if row.get("country"): info["countries"].add(row["country"])
+        prods = row.get("products", [])
+        if isinstance(prods, str):
+            try: prods = json.loads(prods)
+            except Exception: prods = []
+        if isinstance(prods, list): info["prods"] += len(prods)
+    for ct in contacts:
+        comp = (ct.get("company") or "").strip() or "Unknown"
+        co_map.setdefault(comp, {"docs": 0, "prods": 0, "contacts": 0, "countries": set()})["contacts"] += 1
+    for comp in sorted(co_map):
+        info = co_map[comp]
+        ws_co.append([comp, info["docs"], info["prods"], info["contacts"], ", ".join(sorted(info["countries"]))])
+    style_header(ws_co)
+
+    # Sheet 5: Categories (product categories aggregated)
+    ws_cat = wb.create_sheet("Categories")
+    ws_cat.append(["category", "product_count", "companies"])
+    cat_map: dict = {}
+    for row in data:
+        comp = row.get("company") or "Unknown"
+        prods = row.get("products", [])
+        if isinstance(prods, str):
+            try: prods = json.loads(prods)
+            except Exception: prods = []
+        if not isinstance(prods, list): continue
+        for p in prods:
+            if not isinstance(p, dict): continue
+            cat = (p.get("category") or "Uncategorized").strip()
+            info = cat_map.setdefault(cat, {"count": 0, "companies": set()})
+            info["count"] += 1
+            info["companies"].add(comp)
+    for cat in sorted(cat_map):
+        info = cat_map[cat]
+        ws_cat.append([cat, info["count"], ", ".join(sorted(info["companies"]))])
+    style_header(ws_cat)
+
+    # Sheet 6: Specs (one row per product spec)
+    ws_specs = wb.create_sheet("Specs")
+    ws_specs.append(["company", "product", "model", "spec_key", "spec_value"])
+    for row in data:
+        comp = row.get("company") or ""
+        prods = row.get("products", [])
+        if isinstance(prods, str):
+            try: prods = json.loads(prods)
+            except Exception: prods = []
+        if not isinstance(prods, list): continue
+        for p in prods:
+            if not isinstance(p, dict): continue
+            specs = p.get("specs")
+            if not specs: continue
+            if isinstance(specs, dict):
+                for k, v in specs.items():
+                    ws_specs.append([comp, p.get("name") or p.get("product_name", ""), p.get("model", ""), k, str(v)])
+            elif isinstance(specs, str):
+                # comma-separated specs string
+                for chunk in specs.split(","):
+                    chunk = chunk.strip()
+                    if ":" in chunk:
+                        k, _, v = chunk.partition(":")
+                        ws_specs.append([comp, p.get("name") or p.get("product_name", ""), p.get("model", ""), k.strip(), v.strip()])
+                    elif chunk:
+                        ws_specs.append([comp, p.get("name") or p.get("product_name", ""), p.get("model", ""), "", chunk])
+    style_header(ws_specs)
+
+    # Sheet 7: Gallery (image inventory)
+    ws_gal = wb.create_sheet("Gallery")
+    ws_gal.append(["folder", "source_file", "company", "image_type", "owner_name", "created_at", "image_url"])
+    for row in data:
+        if row.get("source_file"):
+            url = f"/api/image/{row.get('folder', '')}/{row.get('source_file', '')}"
+            ws_gal.append([
+                row.get("folder", ""),
+                row.get("source_file", ""),
+                row.get("company", ""),
+                row.get("image_type", ""),
+                row.get("owner_name", ""),
+                row.get("created_at", ""),
+                url,
+            ])
+    style_header(ws_gal)
+
+    # Sheet 8: Summary
     ws_sum = wb.create_sheet("Summary")
     sum_headers = ["company", "document_count", "product_count", "has_contact"]
     ws_sum.append(sum_headers)
@@ -1264,6 +1386,20 @@ def export_xlsx(user=Depends(current_user)):
             company_info[comp]["prod_count"] += len(prods)
     for comp, info in sorted(company_info.items()):
         ws_sum.append([comp, info["doc_count"], info["prod_count"], "Yes" if comp in contact_companies else "No"])
+    style_header(ws_sum)
+
+    # Auto-size columns (light heuristic)
+    for ws in wb.worksheets:
+        for col_idx, col in enumerate(ws.columns, start=1):
+            max_len = 12
+            for cell in col:
+                try:
+                    v = cell.value
+                    if v is not None:
+                        max_len = max(max_len, min(60, len(str(v))))
+                except Exception:
+                    pass
+            ws.column_dimensions[chr(64 + col_idx) if col_idx <= 26 else "A"].width = max_len + 2
 
     output = io.BytesIO()
     wb.save(output)
