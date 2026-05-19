@@ -123,7 +123,6 @@
   let result = $state(null);
   let fileInput;
   let cameraInput;
-  let libraryInput;
   let uploadError = $state('');
   let uploadProgress = $state(0);
   let dragOver = $state(false);
@@ -466,29 +465,17 @@
       ondragover={handleDragOver}
       ondragleave={handleDragLeave}
     >
-      <button class="hero-camera" onclick={() => cameraInput.click()} type="button" aria-label="Take photo">
-        <span class="hero-cam-ico">&#128247;</span>
-      </button>
-      <p class="hero-label">Take a photo</p>
-      <p class="hero-sub">Rear camera, multi-shot</p>
-      <div class="chip-row">
-        <button class="chip-btn" onclick={() => libraryInput.click()} type="button">
-          <span class="chip-ico">&#127748;</span>
-          <span class="chip-text">Library</span>
-          <span class="chip-hint">JPG · PNG · HEIC</span>
+      <div class="two-btn-row">
+        <button class="big-btn primary" onclick={() => cameraInput.click()} type="button">
+          <span class="big-btn-ico">&#128247;</span>
+          <span class="big-btn-label">Take picture</span>
+          <span class="big-btn-sub">Rear camera</span>
         </button>
-        <button class="chip-btn" onclick={() => fileInput.click()} type="button">
-          <span class="chip-ico">&#128206;</span>
-          <span class="chip-text">Files</span>
-          <span class="chip-hint">PDF · any image</span>
+        <button class="big-btn" onclick={() => fileInput.click()} type="button">
+          <span class="big-btn-ico">&#128190;</span>
+          <span class="big-btn-label">Upload</span>
+          <span class="big-btn-sub">Photos or files (PDF, JPG, PNG, HEIC)</span>
         </button>
-      </div>
-      <div class="info-note">
-        <span class="info-ico">&#128161;</span>
-        <span>
-          <strong>For best metadata:</strong> use <strong>Library</strong> (preserves GPS, camera, date)
-          or share via Photos → Kontact PWA. Browser <strong>Camera</strong> strips most EXIF.
-        </span>
       </div>
       {#if gettingGeo}
         <p class="geo-hint">&#128205; Getting location…</p>
@@ -505,14 +492,6 @@
       type="file"
       accept="image/*"
       capture="environment"
-      multiple
-      onchange={handleFiles}
-      class="file-input-hidden"
-    />
-    <input
-      bind:this={libraryInput}
-      type="file"
-      accept="image/*"
       multiple
       onchange={handleFiles}
       class="file-input-hidden"
@@ -666,6 +645,46 @@
     font-size: 18px; line-height: 1;
     padding: 0 4px;
   }
+
+  .two-btn-row {
+    display: flex;
+    gap: 12px;
+    width: 100%;
+    max-width: 520px;
+    margin: 0 auto;
+  }
+  @media (max-width: 520px) {
+    .two-btn-row { flex-direction: column; }
+  }
+  .big-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 24px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    font-family: inherit;
+    transition: transform 0.1s, border-color 0.15s, background 0.15s;
+  }
+  .big-btn:hover {
+    border-color: var(--accent);
+    transform: translateY(-2px);
+  }
+  .big-btn:active { transform: scale(0.98); }
+  .big-btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+  }
+  .big-btn.primary:hover { background: var(--accent); filter: brightness(1.05); }
+  .big-btn-ico { font-size: 36px; line-height: 1; }
+  .big-btn-label { font-size: 16px; font-weight: 600; }
+  .big-btn-sub { font-size: 12px; opacity: 0.75; }
 
   .hero-zone {
     display: flex;
