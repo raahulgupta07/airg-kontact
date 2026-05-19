@@ -1,6 +1,35 @@
 <script lang="ts">
   let { categories = [], documents = [] } = $props();
 
+  let aiBusy = $state(false);
+  let aiMsg = $state('');
+
+  async function autoCategorize(force = false) {
+    if (aiBusy) return;
+    aiBusy = true;
+    aiMsg = 'AI categorizing…';
+    try {
+      const r = await fetch('/api/categories/auto', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force }),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        aiMsg = `✓ Categorized ${d.updated} of ${d.scanned}. Refresh to see.`;
+        setTimeout(() => location.reload(), 1500);
+      } else {
+        const e = await r.json().catch(() => ({}));
+        aiMsg = `Failed: ${e.detail || r.status}`;
+      }
+    } catch (e: any) {
+      aiMsg = `Error: ${e?.message || 'network'}`;
+    } finally {
+      aiBusy = false;
+    }
+  }
+
   // Build category -> [documents]
   function docsByCategory() {
     const map: Record<string, any[]> = {};
@@ -59,7 +88,16 @@
 <svelte:window onkeydown={onKey} />
 
 <div class="card table-card">
-  <h2>Categories</h2>
+  <div class="cat-toolbar">
+    <h2>Categories</h2>
+    <div class="cat-tools">
+      <button class="btn-ai" onclick={() => autoCategorize(false)} disabled={aiBusy}>
+        {aiBusy ? '⏳ Working…' : '✨ Auto-categorize'}
+      </button>
+      <button class="btn-ghost xs" onclick={() => autoCategorize(true)} disabled={aiBusy} title="Re-categorize all (overwrites existing)">Re-do all</button>
+    </div>
+  </div>
+  {#if aiMsg}<p class="ai-msg">{aiMsg}</p>{/if}
   {#if categories.length === 0 && documents.length === 0}
     <p class="muted">No categories yet.</p>
   {:else}
@@ -139,7 +177,40 @@
 
 <style>
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); padding: 16px; }
-  .card h2 { margin: 0 0 12px; font-size: 16px; font-weight: 600; color: var(--text); }
+  .card h2 { margin: 0; font-size: 16px; font-weight: 600; color: var(--text); }
+  .cat-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .cat-tools { margin-left: auto; display: flex; gap: 6px; }
+  .btn-ai {
+    background: var(--accent);
+    color: white;
+    border: 1px solid var(--accent);
+    padding: 7px 14px;
+    border-radius: var(--r-md);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .btn-ai:hover { filter: brightness(1.05); }
+  .btn-ai:disabled { opacity: 0.6; cursor: not-allowed; }
+  .btn-ghost.xs {
+    background: transparent;
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    border-radius: var(--r-md);
+    font-size: 12px;
+    cursor: pointer;
+    font-family: inherit;
+    color: var(--text-muted);
+  }
+  .ai-msg {
+    font-size: 13px;
+    color: var(--accent);
+    background: var(--accent-soft, rgba(201,100,66,0.08));
+    padding: 8px 12px;
+    border-radius: var(--r-md);
+    margin: 0 0 12px;
+  }
   .muted { color: var(--text-muted); font-size: 13px; }
 
   .cat-sections { display: flex; flex-direction: column; gap: 12px; }

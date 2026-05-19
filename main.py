@@ -1005,6 +1005,101 @@ def get_data(
     return rows
 
 
+@app.post("/api/categories/auto")
+async def auto_categorize(payload: dict = None, user=Depends(current_user)):
+    """Use LLM to assign categories to products that lack one.
+
+    Body (optional): {"force": true} to recategorize all products.
+    Batches 12 products per LLM call. Visible-scope only.
+    """
+    force = bool((payload or {}).get("force"))
+    vc, vp = db.visibility_clause("", user)
+    where_parts = []
+    if not force:
+        where_parts.append("(category IS NULL OR TRIM(category) = '')")
+    if vc:
+        where_parts.append(vc)
+    where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    c = db._conn()
+    try:
+        rows = c.execute(
+            f"SELECT uuid, name, model, specs, company FROM products {where} LIMIT 500",
+            vp,
+        ).fetchall()
+    finally:
+        c.close()
+
+    if not rows:
+        return {"updated": 0, "scanned": 0, "message": "No products to categorize"}
+
+    import httpx as _httpx
+
+    async def _classify_batch(batch):
+        items = "\n".join(
+            f"{i+1}. name={r['name'] or ''} | model={r['model'] or ''} | "
+            f"company={r['company'] or ''} | specs={(r['specs'] or '')[:120]}"
+            for i, r in enumerate(batch)
+        )
+        prompt = (
+            "You are a product taxonomy classifier. For each numbered product below, "
+            "return ONE short category (2-4 words, Title Case). Use general industry "
+            "categories like 'Industrial Pumps', 'LED Displays', 'Power Tools', "
+            "'Auto Parts', 'Office Supplies', 'Packaging Machinery', etc. "
+            "Return ONLY a JSON array of strings, exactly one per input, in order. "
+            f"No prose.\n\nProducts:\n{items}"
+        )
+        payload = {
+            "model": config.VISION_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 800,
+            "temperature": 0,
+        }
+        headers = {
+            "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        async with _httpx.AsyncClient() as cl:
+            r = await cl.post(config.OPENROUTER_BASE, json=payload, headers=headers, timeout=60)
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"].strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+        try:
+            cats = json.loads(text)
+        except Exception:
+            return [None] * len(batch)
+        if not isinstance(cats, list):
+            return [None] * len(batch)
+        return [str(x).strip()[:50] if x else None for x in cats[:len(batch)]]
+
+    updated = 0
+    BATCH = 12
+    for i in range(0, len(rows), BATCH):
+        batch = rows[i:i + BATCH]
+        try:
+            cats = await _classify_batch(batch)
+        except Exception as e:
+            print(f"[auto-categorize] batch {i} failed: {e}")
+            continue
+        c = db._conn()
+        try:
+            for r, cat in zip(batch, cats):
+                if cat:
+                    c.execute(
+                        "UPDATE products SET category = ?, updated_at = CURRENT_TIMESTAMP, "
+                        "edit_count = COALESCE(edit_count,0)+1 WHERE uuid = ?",
+                        (cat, r["uuid"]),
+                    )
+                    updated += 1
+            c.commit()
+        finally:
+            c.close()
+
+    db.log_event_safe("auto_categorize", "products", None, user["uuid"],
+                      detail={"updated": updated, "scanned": len(rows), "force": force})
+    return {"updated": updated, "scanned": len(rows)}
+
+
 @app.get("/api/aggregations/trade-shows")
 def agg_trade_shows(user=Depends(current_user)):
     """List distinct trade-show labels visible to user with doc count."""
