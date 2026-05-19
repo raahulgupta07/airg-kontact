@@ -226,7 +226,12 @@
               </span>
               <div class="q-row-info">
                 <span class="q-row-name">{batch.batch_id}</span>
-                <span class="q-row-detail">{total} images · {pct}% done</span>
+                <span class="q-row-detail">
+                  {total} images · {pct}% done
+                  {#if batch.owner_name} · by <strong>{batch.owner_name}</strong>{/if}
+                  {#if batch.trade_show} · <em>{batch.trade_show}</em>{/if}
+                  {#if batch.created} · {new Date(batch.created.replace(' ', 'T') + 'Z').toLocaleString()}{/if}
+                </span>
                 <div class="q-progress" class:processing={batch.pending > 0} class:has-errors={batch.errors > 0 && batch.pending === 0}>
                   <div class="q-progress-fill" style="width:{pct}%"></div>
                 </div>
@@ -318,6 +323,12 @@
                           {#if doc.contact.email}{doc.contact.email}{/if}
                         </div>
                       {/if}
+                      <div class="q-doc-foot">
+                        {#if doc.owner_name}by {doc.owner_name}{/if}
+                        {#if doc.created_at}
+                          {#if doc.owner_name} · {/if}{new Date(doc.created_at).toLocaleString()}
+                        {/if}
+                      </div>
                     </div>
                   </div>
                   {#if i < expandedData.length - 1}
@@ -404,6 +415,15 @@
         {/if}
         {#if lightboxDoc.date_taken}
           <div class="lb-meta-row">Taken: {lightboxDoc.date_taken}</div>
+        {/if}
+        {#if lightboxDoc.created_at}
+          <div class="lb-meta-row">Uploaded: {new Date(lightboxDoc.created_at).toLocaleString()}</div>
+        {/if}
+        {#if lightboxDoc.owner_name}
+          <div class="lb-meta-row">By: {lightboxDoc.owner_name}</div>
+        {/if}
+        {#if lightboxDoc.blur_score != null}
+          <div class="lb-meta-row">Sharpness score: {lightboxDoc.blur_score.toFixed(1)} {lightboxDoc.is_blurry ? '(blurry)' : '(sharp)'}</div>
         {/if}
       </div>
     </div>
@@ -495,6 +515,7 @@
   .q-doc-more { color:var(--accent); margin-left:4px; }
   .q-doc-company { font-size:12px; color:var(--text-muted); font-weight:500; }
   .q-doc-contact { font-size:11px; color:var(--text-faint); font-family:var(--font-mono); }
+  .q-doc-foot { font-size:11px; color:var(--text-faint); margin-top:4px; }
 
   .q-doc-sep { border-bottom:1px solid var(--border); margin:0; }
 

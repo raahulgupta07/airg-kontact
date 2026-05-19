@@ -17,7 +17,7 @@ from PIL import Image
 # which introduce mild high-freq attenuation. 40 keeps obvious blur
 # (var ~5-15) while letting sharp compressed photos (var ~80-400) pass.
 # Env override: BLUR_THRESHOLD=<float>
-BLUR_THRESHOLD = float(os.getenv("BLUR_THRESHOLD", "40"))
+BLUR_THRESHOLD = float(os.getenv("BLUR_THRESHOLD", "20"))
 
 
 from typing import Optional
