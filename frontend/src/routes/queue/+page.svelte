@@ -14,12 +14,54 @@
   let expandedBatch = $state(null);
   let expandedData = $state([]);
 
-  // Lightbox
+  // Lightbox — supports PDF page navigation by grouping _pageN siblings
   let lightboxDoc = $state(null);
-  function openLightbox(doc) { lightboxDoc = doc; }
-  function closeLightbox() { lightboxDoc = null; }
+  let lightboxSiblings = $state([]);
+  let lightboxIdx = $state(0);
+
+  function _pdfGroupKey(fname) {
+    // Returns base name without _pageN.jpg suffix, or null if not a PDF page
+    if (!fname) return null;
+    const m = fname.match(/^(.*?)_page\d+\.(jpe?g|png)$/i);
+    return m ? m[1] : null;
+  }
+  function _pageNum(fname) {
+    const m = (fname || '').match(/_page(\d+)\./i);
+    return m ? parseInt(m[1], 10) : 0;
+  }
+
+  function openLightbox(doc) {
+    // Group sibling pages from same PDF
+    const grpKey = _pdfGroupKey(doc.source_file);
+    if (grpKey) {
+      lightboxSiblings = expandedData
+        .filter(d => _pdfGroupKey(d.source_file) === grpKey)
+        .sort((a, b) => _pageNum(a.source_file) - _pageNum(b.source_file));
+      lightboxIdx = lightboxSiblings.findIndex(d => d.uuid === doc.uuid);
+      if (lightboxIdx < 0) lightboxIdx = 0;
+    } else {
+      lightboxSiblings = [doc];
+      lightboxIdx = 0;
+    }
+    lightboxDoc = lightboxSiblings[lightboxIdx];
+  }
+  function closeLightbox() { lightboxDoc = null; lightboxSiblings = []; }
+  function lbNext() {
+    if (lightboxIdx < lightboxSiblings.length - 1) {
+      lightboxIdx += 1;
+      lightboxDoc = lightboxSiblings[lightboxIdx];
+    }
+  }
+  function lbPrev() {
+    if (lightboxIdx > 0) {
+      lightboxIdx -= 1;
+      lightboxDoc = lightboxSiblings[lightboxIdx];
+    }
+  }
   function onLightboxKey(e) {
     if (e.key === 'Escape') closeLightbox();
+    else if (e.key === 'ArrowRight') lbNext();
+    else if (e.key === 'ArrowLeft') lbPrev();
   }
   let toast = $state(null);
 
@@ -116,7 +158,28 @@
     expandedBatch = bid;
   }
 
-  $effect(() => { fetchBatches(); return () => { if (pollTimer) clearInterval(pollTimer); }; });
+  $effect(() => { fetchBatches(); return () => { if (pollTimer) clearInterval(pollTimer); if (autoPollTimer) clearInterval(autoPollTimer); }; });
+
+  // Auto-poll while any batch has pending > 0
+  let autoPollTimer = $state(null);
+  $effect(() => {
+    const hasPending = batches.some(b => (b.pending || 0) > 0);
+    if (hasPending && !autoPollTimer) {
+      autoPollTimer = setInterval(() => { fetchBatches(); }, 2500);
+    } else if (!hasPending && autoPollTimer) {
+      clearInterval(autoPollTimer); autoPollTimer = null;
+    }
+  });
+
+  function batchPct(b) {
+    if (!b || !b.total) return 0;
+    return Math.round(((b.done || 0) / b.total) * 100);
+  }
+  function batchStatus(b) {
+    if (b.errors > 0 && b.pending === 0) return 'errors';
+    if (b.pending > 0) return 'processing';
+    return 'done';
+  }
   function totalPending() { return batches.reduce((s, b) => s + (b.pending ?? 0), 0); }
 </script>
 
@@ -164,6 +227,9 @@
               <div class="q-row-info">
                 <span class="q-row-name">{batch.batch_id}</span>
                 <span class="q-row-detail">{total} images · {pct}% done</span>
+                <div class="q-progress" class:processing={batch.pending > 0} class:has-errors={batch.errors > 0 && batch.pending === 0}>
+                  <div class="q-progress-fill" style="width:{pct}%"></div>
+                </div>
               </div>
             </div>
             <div class="q-row-right">
@@ -290,6 +356,13 @@
   <div class="lb-backdrop" onclick={closeLightbox}>
     <div class="lb-modal" onclick={(e) => e.stopPropagation()}>
       <button class="lb-close" onclick={closeLightbox} aria-label="Close">×</button>
+      {#if lightboxSiblings.length > 1}
+        <div class="lb-pager">
+          <button class="lb-nav" onclick={lbPrev} disabled={lightboxIdx === 0} aria-label="Previous page">◀</button>
+          <span class="lb-page-info">Page {lightboxIdx + 1} of {lightboxSiblings.length}</span>
+          <button class="lb-nav" onclick={lbNext} disabled={lightboxIdx === lightboxSiblings.length - 1} aria-label="Next page">▶</button>
+        </div>
+      {/if}
       <img
         class="lb-img"
         src={`/api/image/${lightboxDoc.folder}/${lightboxDoc.source_file}`}
@@ -355,7 +428,31 @@
   .q-row-main { display:flex; justify-content:space-between; align-items:center; padding:14px 16px; gap:12px; }
   .q-row-left { display:flex; align-items:center; gap:12px; min-width:0; }
   .q-row-icon { flex-shrink:0; width:20px; height:20px; display:flex; align-items:center; justify-content:center; }
-  .q-row-info { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .q-row-info { display:flex; flex-direction:column; gap:4px; min-width:0; flex:1; }
+  .q-progress {
+    width: 100%;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-top: 4px;
+  }
+  .q-progress-fill {
+    height: 100%;
+    background: var(--success, #22c55e);
+    transition: width 0.3s ease;
+  }
+  .q-progress.processing .q-progress-fill { background: var(--accent); }
+  .q-progress.has-errors .q-progress-fill { background: var(--danger); }
+  @keyframes q-stripes {
+    0% { background-position: 0 0; }
+    100% { background-position: 14px 0; }
+  }
+  .q-progress.processing .q-progress-fill {
+    background-image: linear-gradient(45deg, rgba(255,255,255,0.18) 25%, transparent 25%, transparent 50%, rgba(255,255,255,0.18) 50%, rgba(255,255,255,0.18) 75%, transparent 75%, transparent);
+    background-size: 14px 14px;
+    animation: q-stripes 0.6s linear infinite;
+  }
   .q-row-name { font-weight:600; font-size:14px; color:var(--text); font-family: var(--font-mono); }
   .q-row-detail { font-size:12px; color:var(--text-muted); }
 
@@ -490,4 +587,29 @@
     .lb-modal { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
     .lb-img { max-height: 50vh; }
   }
+  .lb-pager {
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: rgba(0,0,0,0.55);
+    color: white;
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 13px;
+  }
+  .lb-nav {
+    background: none;
+    border: none;
+    color: white;
+    font-size: 16px;
+    cursor: pointer;
+    padding: 2px 6px;
+  }
+  .lb-nav:disabled { opacity: 0.3; cursor: not-allowed; }
+  .lb-page-info { font-weight: 600; font-size: 12px; }
 </style>

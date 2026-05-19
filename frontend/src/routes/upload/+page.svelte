@@ -96,7 +96,15 @@
   let online = $state(true);
 
   function syncOnline() {
-    if (typeof navigator !== 'undefined') online = navigator.onLine;
+    if (typeof navigator !== 'undefined') {
+      const was = online;
+      online = navigator.onLine;
+      // Auto-retry: if we have queued files + just came back online + not already uploading, retry
+      if (!was && online && files.length > 0 && uploading === 'idle') {
+        console.log('[kontact] back online — retrying queued upload');
+        queueMicrotask(() => upload());
+      }
+    }
   }
 
   onMount(() => {
@@ -140,6 +148,27 @@
 
   const MAX_DIM = 2000;
   const JPEG_QUALITY = 0.85;
+  const COMPRESS_CONCURRENCY = 4;  // simultaneous compressions on phone
+
+  // Pool of N async workers — throttles CPU on phone
+  async function pool(items, fn, concurrency) {
+    const results = new Array(items.length);
+    let idx = 0;
+    async function worker() {
+      while (idx < items.length) {
+        const i = idx++;
+        results[i] = await fn(items[i], i);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+    return results;
+  }
+
+  // Upload phases (drives overlay)
+  type Phase = 'idle' | 'compressing' | 'uploading';
+  let phase = $state<Phase>('idle');
+  let compressDone = $state(0);
+  let compressTotal = $state(0);
 
   async function compressImage(file) {
     // Skip if not image, already small, or fast mode off
@@ -274,14 +303,29 @@
     uploadError = '';
     uploadProgress = 0;
     try {
-      // Compress in parallel before sending (5-20× smaller for phone photos)
+      // Compress with throttled pool (4 concurrent) to keep phone CPU responsive
       const beforeBytes = files.reduce((n, f) => n + (f.size || 0), 0);
-      const compressed = await Promise.all(files.map(compressImage));
+      // Pre-flight size warning for very large batches
+      if (beforeBytes > 500_000_000 && !confirm(
+        `You are about to upload ${(beforeBytes/1e6).toFixed(0)} MB across ${files.length} files. Continue?`
+      )) {
+        uploading = 'idle';
+        return;
+      }
+      phase = 'compressing';
+      compressDone = 0;
+      compressTotal = files.length;
+      const compressed = await pool(files, async (f) => {
+        const out = await compressImage(f);
+        compressDone += 1;
+        return out;
+      }, COMPRESS_CONCURRENCY);
       const afterBytes = compressed.reduce((n, f) => n + (f.size || 0), 0);
       if (beforeBytes > 0 && afterBytes < beforeBytes) {
         const saved = Math.round((1 - afterBytes / beforeBytes) * 100);
         console.log(`[kontact] compressed ${(beforeBytes/1e6).toFixed(1)}MB → ${(afterBytes/1e6).toFixed(1)}MB (-${saved}%)`);
       }
+      phase = 'uploading';
       const formData = new FormData();
       for (const file of compressed) {
         formData.append('files', file);
@@ -344,14 +388,22 @@
       });
       result = res;
       uploading = 'done';
+      phase = 'idle';
       // Auto-redirect to queue after brief confirmation so user sees progress
       if (res && res.queued && res.queued > 0) {
         setTimeout(() => goto('/queue'), 900);
       }
     } catch (err) {
       console.error('Upload failed:', err);
-      uploadError = err instanceof Error ? err.message : 'Upload failed. Please try again.';
+      const msg = err instanceof Error ? err.message : 'Upload failed';
+      // If offline, keep files queued + show queued banner; will auto-retry on reconnect
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        uploadError = `Offline — ${files.length} file${files.length > 1 ? 's' : ''} queued. Will retry automatically when back online.`;
+      } else {
+        uploadError = `${msg}. Please try again.`;
+      }
       uploading = 'idle';
+      phase = 'idle';
     }
   }
 </script>
@@ -389,6 +441,9 @@
   {/if}
 
   {#if uploading === 'uploading'}
+    {@const displayPct = phase === 'compressing'
+        ? (compressTotal > 0 ? Math.round((compressDone / compressTotal) * 100) : 0)
+        : uploadProgress}
     <div class="upload-overlay" role="status" aria-live="polite">
       <div class="upload-overlay-inner">
         <div class="upload-ring">
@@ -398,12 +453,20 @@
               class="ring-fg"
               cx="50" cy="50" r="44"
               stroke-dasharray="276.46"
-              stroke-dashoffset={276.46 - (276.46 * uploadProgress / 100)}
+              stroke-dashoffset={276.46 - (276.46 * displayPct / 100)}
             />
           </svg>
-          <div class="upload-pct">{uploadProgress}%</div>
+          <div class="upload-pct">{displayPct}%</div>
         </div>
-        <p class="upload-line">Uploading {files.length} file{files.length !== 1 ? 's' : ''}…</p>
+        <p class="upload-line">
+          {#if phase === 'compressing'}
+            Compressing {compressDone}/{compressTotal}…
+          {:else if phase === 'uploading'}
+            Uploading {files.length} file{files.length !== 1 ? 's' : ''}…
+          {:else}
+            Preparing…
+          {/if}
+        </p>
         <p class="upload-sub">Don't leave this page yet</p>
       </div>
     </div>

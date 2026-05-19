@@ -440,12 +440,37 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
                 page_dest = os.path.join(batch_dir, page_name)
                 img.save(page_dest, format="JPEG", quality=90)
                 db.queue_add(batch_id, page_name, page_dest, owner_uuid=user["uuid"], trade_show=trade_show)
-                # Mirror to remote storage (no-op for local backend)
                 try:
                     storage.save_file(upload_key(batch_id, page_name), page_dest, "image/jpeg")
                 except Exception as _se:
                     print(f"[storage] mirror failed for {page_name}: {_se}")
                 queued.append(page_name)
+
+                # Tier B: extract embedded images on this page (skipped from queue —
+                # they are enrichment thumbnails, not LLM-extracted documents).
+                try:
+                    img_refs = page.get_images(full=True)
+                    for j, ref in enumerate(img_refs[:20], start=1):  # cap 20/page
+                        xref = ref[0]
+                        try:
+                            pix2 = fitz.Pixmap(doc, xref)
+                            if pix2.n - pix2.alpha >= 4:  # CMYK or weird
+                                pix2 = fitz.Pixmap(fitz.csRGB, pix2)
+                            if pix2.width < 80 or pix2.height < 80:
+                                pix2 = None
+                                continue
+                            emb_name = f"{base_name}_page{i}_emb{j}.jpg"
+                            emb_dest = os.path.join(batch_dir, emb_name)
+                            pix2.save(emb_dest, "jpeg")
+                            pix2 = None
+                            try:
+                                storage.save_file(upload_key(batch_id, emb_name), emb_dest, "image/jpeg")
+                            except Exception:
+                                pass
+                        except Exception as _ee:
+                            print(f"[pdf] embedded extract failed page {i} img {j}: {_ee}")
+                except Exception as _ge:
+                    print(f"[pdf] get_images failed on page {i}: {_ge}")
             doc.close()
         else:
             db.queue_add(batch_id, safe_name, dest, owner_uuid=user["uuid"], trade_show=trade_show)
