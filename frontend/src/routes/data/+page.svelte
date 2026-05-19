@@ -700,7 +700,7 @@
   {:else if activeTab === 'companies'}
     <CompaniesTable {companies} />
   {:else if activeTab === 'categories'}
-    <CategoriesTable categories={categoryBreakdown} />
+    <CategoriesTable categories={categoryBreakdown} documents={docs} />
   {:else if activeTab === 'specs'}
     <SpecsTable specs={products} />
   {:else if activeTab === 'gallery'}
