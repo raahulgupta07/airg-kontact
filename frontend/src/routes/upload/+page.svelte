@@ -2,6 +2,7 @@
   import { goto } from '$app/navigation';
   import { onMount, onDestroy } from 'svelte';
   import exifr from 'exifr';
+  import { uploadQueue } from '$lib/uploadQueue.svelte';
 
   async function readClientExif(file) {
     try {
@@ -251,10 +252,12 @@
   function handleFiles(event) {
     const selected = Array.from(event.target.files ?? []);
     if (!selected.length) return;
-    files = [...files, ...selected];
     checkImageQuality(selected);
-    // Auto-submit: as soon as a file is picked, fire upload + go to queue
-    queueMicrotask(() => { if (!uploading || uploading === 'idle') upload(); });
+    // Fire-and-forget: enqueue to global tray. User can keep picking more.
+    uploadQueue.setFastMode(fastMode);
+    uploadQueue.enqueue(selected, tradeShow);
+    // Clear input so same file can be re-selected later
+    if (event.target) event.target.value = '';
   }
 
   function handleDrop(event) {
@@ -262,9 +265,9 @@
     dragOver = false;
     const dropped = Array.from(event.dataTransfer.files).filter(f => f.type.startsWith('image/') || f.type === 'application/pdf');
     if (!dropped.length) return;
-    files = [...files, ...dropped];
     checkImageQuality(dropped);
-    queueMicrotask(() => { if (!uploading || uploading === 'idle') upload(); });
+    uploadQueue.setFastMode(fastMode);
+    uploadQueue.enqueue(dropped, tradeShow);
   }
 
   function handleDragOver(event) {
@@ -441,78 +444,14 @@
     </div>
   {/if}
 
-  {#if uploading === 'uploading'}
-    {@const displayPct = phase === 'compressing'
-        ? (compressTotal > 0 ? Math.round((compressDone / compressTotal) * 100) : 0)
-        : uploadProgress}
-    {@const finalizing = phase === 'uploading' && uploadProgress >= 100}
-    <div class="upload-overlay" role="status" aria-live="polite">
-      <div class="upload-overlay-inner">
-        <div class="upload-ring" class:spin={finalizing}>
-          <svg viewBox="0 0 100 100" width="120" height="120" aria-hidden="true">
-            <circle class="ring-bg" cx="50" cy="50" r="44" />
-            <circle
-              class="ring-fg"
-              cx="50" cy="50" r="44"
-              stroke-dasharray="276.46"
-              stroke-dashoffset={finalizing ? 70 : (276.46 - (276.46 * displayPct / 100))}
-            />
-          </svg>
-          {#if finalizing}
-            <div class="upload-pct" style="font-size:14px;">Finalizing</div>
-          {:else}
-            <div class="upload-pct">{displayPct}%</div>
-          {/if}
-        </div>
-        <p class="upload-line">
-          {#if phase === 'compressing'}
-            Compressing {compressDone}/{compressTotal}…
-          {:else if finalizing}
-            Server is finalizing your upload…
-          {:else if phase === 'uploading'}
-            Uploading {files.length} file{files.length !== 1 ? 's' : ''}…
-          {:else}
-            Preparing…
-          {/if}
-        </p>
-        <p class="upload-sub">
-          {#if finalizing}
-            Almost done — just a moment
-          {:else}
-            Don't leave this page yet
-          {/if}
-        </p>
-      </div>
+  {#if uploadQueue.hasActive}
+    <div class="upload-hint">
+      <span class="dot"></span>
+      {uploadQueue.activeCount} uploading in background · keep adding more
     </div>
   {/if}
 
-  {#if uploading === 'done' && result}
-    <div class="success-block card">
-      <div class="success-icon">&#10003;</div>
-      <p class="success-text">Batch uploaded</p>
-      <p class="file-count">{result.queued ?? files.length} of {files.length} image{files.length !== 1 ? 's' : ''} sent for processing</p>
-      {#if result.skipped && result.skipped.length}
-        <div class="skipped-block">
-          <p class="skipped-title">Skipped {result.skipped.length}:</p>
-          <ul class="skipped-list">
-            {#each result.skipped as s}
-              <li>{s.name} — {s.reason}</li>
-            {/each}
-          </ul>
-        </div>
-      {/if}
-      <div class="success-actions">
-        <button class="send-btn" onclick={() => goto('/queue')}>View queue</button>
-        <button class="btn-ghost" onclick={() => {
-          files = [];
-          warnings = [];
-          uploading = 'idle';
-          result = null;
-        }}>Upload more</button>
-      </div>
-    </div>
-  {:else}
-    {#if uploadError}
+  {#if uploadError}
       <div class="banner banner-error">
         <span>{uploadError}</span>
         <button class="banner-dismiss" onclick={() => uploadError = ''} aria-label="dismiss">&times;</button>
@@ -605,10 +544,9 @@
         {/each}
       </div>
     {/if}
-  {/if}
 </div>
 
-{#if uploading !== 'done'}
+{#if false}
   <div class="upload-bar" class:visible={files.length > 0 || uploading === 'uploading'}>
     <div class="upload-bar-inner">
       {#if uploading === 'uploading'}

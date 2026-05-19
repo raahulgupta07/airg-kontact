@@ -5,6 +5,7 @@
   import { onMount } from 'svelte';
   import { theme, initTheme, toggleTheme } from '$lib/theme';
   import { auth } from '$lib/auth.svelte';
+  import UploadTray from '$lib/components/UploadTray.svelte';
 
   let { children } = $props();
 
@@ -340,6 +341,7 @@
     </nav>
   </div>
 </div>
+<UploadTray />
 {/if}
 
 <style>
