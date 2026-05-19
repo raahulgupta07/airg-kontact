@@ -12,7 +12,12 @@ except ImportError:
 
 from PIL import Image
 
-BLUR_THRESHOLD = 100.0  # Laplacian var < 100 typically blurry
+# Laplacian variance < threshold = blurry.
+# 100 was too strict for client-compressed JPEGs (q=0.85, 2000px max)
+# which introduce mild high-freq attenuation. 40 keeps obvious blur
+# (var ~5-15) while letting sharp compressed photos (var ~80-400) pass.
+# Env override: BLUR_THRESHOLD=<float>
+BLUR_THRESHOLD = float(os.getenv("BLUR_THRESHOLD", "40"))
 
 
 from typing import Optional
