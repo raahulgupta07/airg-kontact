@@ -438,8 +438,34 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
                 try: os.remove(dest)
                 except Exception: pass
                 raise HTTPException(413, f"PDF {safe_name}: too many pages ({page_count} > 200)")
-            # Defer expensive rasterization to background task so upload returns fast
-            pdf_jobs.append({"dest": dest, "safe_name": safe_name, "page_count": page_count})
+            # Defer expensive rasterization to background task so upload returns fast.
+            # Insert a placeholder queue row IMMEDIATELY so the batch shows up in
+            # /api/queue/batches before BG task creates per-page rows. Placeholder
+            # gets deleted once splitting completes.
+            placeholder_id = None
+            try:
+                db.queue_add(batch_id, safe_name, dest,
+                             owner_uuid=user["uuid"], trade_show=trade_show)
+                # capture id so BG task can delete it after split
+                _c = db._conn()
+                try:
+                    row = _c.execute(
+                        "SELECT id FROM queue WHERE batch_id = ? AND file_name = ? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (batch_id, safe_name),
+                    ).fetchone()
+                    if row:
+                        placeholder_id = row["id"]
+                finally:
+                    _c.close()
+            except Exception as _qe:
+                print(f"[pdf] placeholder queue_add failed: {_qe}")
+            pdf_jobs.append({
+                "dest": dest,
+                "safe_name": safe_name,
+                "page_count": page_count,
+                "placeholder_id": placeholder_id,
+            })
             queued.append(safe_name)
         else:
             db.queue_add(batch_id, safe_name, dest, owner_uuid=user["uuid"], trade_show=trade_show)
@@ -654,6 +680,14 @@ async def _split_pdfs_then_process(
         finally:
             try: doc.close()
             except Exception: pass
+
+        # Remove placeholder queue row now that real page rows exist
+        pid = job.get("placeholder_id")
+        if pid:
+            try:
+                db.queue_delete_by_id(pid)
+            except Exception as _de:
+                print(f"[pdf-bg] failed to remove placeholder {pid}: {_de}")
 
     # Now run the normal LLM processing on everything that was queued
     await _process_batch(batch_id, owner_uuid, client_meta)

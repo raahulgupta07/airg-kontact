@@ -1333,6 +1333,16 @@ def queue_pending(batch_id: str = None) -> list:
     return [dict(r) for r in rows]
 
 
+def queue_delete_by_id(queue_id: int) -> int:
+    c = _conn()
+    try:
+        n = c.execute("DELETE FROM queue WHERE id = ?", (queue_id,)).rowcount
+        c.commit()
+    finally:
+        c.close()
+    return n
+
+
 def queue_update(queue_id: int, status: str, image_type: str = None, error: str = None):
     c = _conn()
     c.execute("UPDATE queue SET status = ?, image_type = ?, error = ?, processed_at = CURRENT_TIMESTAMP WHERE id = ?",
