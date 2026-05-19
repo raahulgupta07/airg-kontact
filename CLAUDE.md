@@ -6,7 +6,7 @@ Internal reference for working on KONTACT. Read this before making changes.
 
 **Multi-tenant catalog vision RAG agent** — trade-show team uploads catalog photos + business-card QRs, extractors structure the data, agent answers SQL-aware questions about who-met-where.
 
-**Status**: Production-shape. 35 fixes/features landed across this session — see "Hardening landmarks" below.
+**Status**: Production-shape. 48 fixes/features landed across this session — see "Hardening landmarks" below.
 
 **Architecture**:
 ```
@@ -46,7 +46,15 @@ City-KONTACT/
 │   └── pricing.py              # Currency + numeric amount parser
 ├── sync/                       # WeChat folder watcher
 ├── data/                       # Runtime: kontact.db, chroma/, uploads/, extractions/, *.json
-├── frontend/src/               # SvelteKit 5 + Svelte 5 runes
+├── frontend/src/
+│   ├── lib/
+│   │   ├── uploadQueue.svelte.ts        # Global UploadQueueState singleton
+│   │   ├── components/UploadTray.svelte # Floating tray (mounted in +layout)
+│   │   ├── components/Gallery.svelte    # Group-by + multi-select + lightbox
+│   │   └── components/CategoriesTable.svelte  # Image grids per category + AI button
+│   └── routes/
+│       ├── profile/+page.svelte         # Change password page
+│       └── upload/+page.svelte          # 2-button compact layout
 ├── backup.sh                   # Full system snapshot → backups/*.tar.gz
 ├── restore.sh
 ├── migrate_to_s3.py            # One-shot upload migration
@@ -230,6 +238,8 @@ GET    /api/products                includes currency + price_amount
 GET    /api/contacts
 GET    /api/contacts/duplicates     dedup suggestions (phone_e164/email)
 POST   /api/contacts/merge          keep_uuid + drop_uuid
+POST   /api/auth/change-password    self-service, requires current_password
+POST   /api/categories/auto         AI categorize products (batch 12/LLM call)
 GET    /api/contacts/{uuid}/vcard   .vcf download
 PATCH  /api/contacts/{uuid}
 DELETE /api/contacts/{uuid}
@@ -350,7 +360,10 @@ Tabs:
 - **Messengers agg empty**: now reads flat platform cols + JSON blob.
 - **WhatsApp invite parser**: `wa.me/qr/CODE` was extracting "qr" as phone. Now detects `/qr/` and `/message/` patterns.
 
-### ✨ 13 features
+### 🐛 +1 functional bug
+- **`crypto.randomUUID()` LAN failure**: throws on http://192.168.x.x (non-secure context). Silent enqueue crash → upload tray never appeared. Fixed via `makeId()` fallback with Date.now+Math.random.
+
+### ✨ 25 features
 - **URL profile resolver** (SSRF-safe JSON-LD/OG extraction; tested w/ GitHub QR → "Linus Torvalds")
 - **ChromaDB pruner** (daily cron + cascade delete)
 - **Email-only login** (frontend locked, backend rejects non-email + ignores PIN)
@@ -366,10 +379,24 @@ Tabs:
 - **Quick filters** (/api/data?trade_show=&country=&has_qr=&has_gps=)
 - **PWA install banner** (beforeinstallprompt + dismissible)
 - **Image lightbox in queue** (click thumb → full image + side panel)
+- **Profile page + self-service password change** (/profile, POST /api/auth/change-password requires current_password; admin reset via /users)
+- **PDF async raster + placeholder queue row** (instant batch visibility, no UI hang)
+- **Floating upload tray** (global UploadQueueState + UploadTray component; non-blocking, cross-route, parallel=2)
+- **Client-side image compression** (Fast mode toggle, createImageBitmap + OffscreenCanvas, 2000px max @ q=0.85, ~95% bandwidth saved)
+- **Two-button upload UI** (Take picture + Upload, mobile compact, above-fold)
+- **Image lightbox in /data Cards** (click thumb → modal, separate from row expand)
+- **Categories tab image grids** (per-category thumbnail sections, lightbox, fallback to image_type for no-product docs)
+- **Gallery group-by toggle** (All / By category / By company / By show + multi-select + bulk download)
+- **AI auto-categorize products** (POST /api/categories/auto, LLM batch 12, fills empty categories)
+- **Excel 8-sheet export** (Documents / Products w/ currency / Contacts / Companies / Categories / Specs / Gallery / Summary, bold+frozen headers, auto-width)
+- **Blur threshold env-overridable** (default 20, was 100 → false positives on compressed JPEGs)
 
 ## Pitfalls
 
 - **Login is email + password only** — phone/PIN paths removed. `users.pin_hash` exists in DB but never read. Don't re-enable PIN without rate-limit tightening (4-digit space is brute-forceable).
+- **`crypto.randomUUID()` requires secure context** — throws on `http://192.168.x.x` LAN IPs. Use `makeId()` helper in `uploadQueue.svelte.ts` for any client-side ID generation. Localhost + HTTPS are fine.
+- **PDF rasterization is async** — request handler inserts a placeholder queue row (file_name=`<pdf>.pdf`) so `/api/queue/batches` shows the batch instantly. Background `_split_pdfs_then_process` rasterizes pages then deletes the placeholder via `db.queue_delete_by_id`. Dispatched via `asyncio.create_task`, NOT `BackgroundTasks` (uvicorn holds connection on BackgroundTasks).
+- **Blur threshold lowered to 20** (was 100). Client-compressed JPEGs (q=0.85, 2000px) score lower Laplacian variance. Env override: `BLUR_THRESHOLD`.
 - **Bcrypt 4.0.1 PINNED** — passlib 1.7.4 breaks with bcrypt 5.x ("password cannot be longer than 72 bytes").
 - **INSERT OR REPLACE forbidden** — FK to products/contacts cascades to constraint failure. Use upsert by (folder, source_file) only.
 - **`file_hash` index** — plain (not UNIQUE) to avoid REPLACE collision when same image uploaded in different batches.

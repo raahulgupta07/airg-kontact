@@ -117,14 +117,49 @@ Free-form prices (`$4,850 USD`, `€ 1.234,50`, `RMB 12,000`, `₹999/-`) parsed
 /api/data?trade_show=CES%202026&country=China&has_qr=1&has_gps=1
 ```
 
-### Image lightbox
-Click any thumbnail in `/queue` → full image + side panel (filename, type chip, company, trade-show chip, contact, products with prices, GPS, camera, date). Esc/backdrop closes. Mobile responsive.
+### Image lightbox (everywhere)
+Click any thumbnail in `/queue`, `/data` (Cards / Categories / Gallery) → full image popup with side panel (filename, type chip, company, trade-show chip, contact, products with prices, GPS, camera, date, sharpness score). Esc / backdrop / × closes. PDF page-grouping with prev/next arrows. Mobile responsive.
+
+### Gallery with grouping + multi-select + bulk download
+- Toolbar: **All / By category / By company / By show**
+- ✨ AI categorize button → uses LLM to fill missing categories
+- **Select** mode → checkbox each thumb → **Download (N)** triggers per-file downloads
+- Category overlay badge on every thumbnail in flat view
+
+### Floating upload tray (non-blocking)
+- Pick photo / PDF → enqueues to global tray (bottom-right or bottom on mobile)
+- Pill shows `N uploading · 72%` + progress bar; tap to expand list
+- User can keep tapping Camera/Library — queue parallelism = 2
+- Survives route navigation (visible across all tabs)
+- Auto-hides 3s after all done
+- Re-fires queued jobs on `window 'online'` event (offline recovery)
+- Each job: queued → compressing → uploading → done/error
+- Cancel/retry/view buttons per row
+
+### Two-button upload UI
+Compact mobile layout — both buttons above the fold:
+- **Take picture** (rear camera, capture=environment)
+- **Upload** (photos OR PDF)
+Trade-show input + Fast mode toggle collapse into `<details>` "Options" panel.
+
+### AI auto-categorize
+`POST /api/categories/auto` → batches 12 products/LLM call → fills `products.category` with concise 2-4 word labels. Two modes: only-uncategorized (safe) or force-all (overwrites). Used by both `/data Categories` tab and `/data Gallery` toolbar.
+
+### Comprehensive Excel export (8 sheets)
+"Excel ⬇" button top-right of `/data` → single `.xlsx`:
+- Documents (every catalog page w/ EXIF + GPS + uploader)
+- Products (with parsed `currency` + `price_amount`)
+- Contacts (with messenger handles)
+- Companies (aggregated)
+- Categories (counts + top companies)
+- Specs (one row per spec)
+- Gallery (image inventory w/ URLs)
+- Summary (per-company rollup)
+
+Bold + frozen headers, auto-sized columns.
 
 ### PWA install
 Bottom banner with "Install" button on Chrome/Edge. Dismissal persisted in localStorage.
-
-### One-tap mobile upload
-Pick file → auto-submits → 900ms confirmation card → auto-redirect to `/queue`.
 
 ---
 
@@ -219,6 +254,10 @@ GET    /api/search/semantic?q=      ChromaDB
 GET    /api/aggregations/{locations,countries,timeline,cameras,messengers,
                           qr-codes,quality,duplicates,sync-sources,pricing,
                           map-points,trade-shows}
+
+# AI helpers
+POST   /api/categories/auto         auto-categorize products via LLM
+                                    body: {force: bool}
 
 # Workspace CRUD
 {GET POST PATCH DELETE} /api/{tags,notes,meetings,events}
@@ -364,6 +403,7 @@ Caddy auto-issues Let's Encrypt cert.
 | `CORS_ORIGINS` | localhost | comma-sep; `*` disables credentials |
 | `MAX_UPLOAD_BYTES` | 104857600 | 100MB per file |
 | `MAX_IMAGE_PIXELS` | 100000000 | PIL bomb guard |
+| `BLUR_THRESHOLD` | 20 | Laplacian var below this = blurry. Lower = more lenient. |
 | `RATE_LIMIT_ENABLED` | true | slowapi toggle |
 | `STORAGE_BACKEND` | local | `s3` for cloud |
 | `S3_BUCKET / S3_*` | — | S3-compatible config |
