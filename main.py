@@ -383,6 +383,7 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
 
     queued = []
     skipped = []
+    pdf_jobs: list = []
     for f in files:
         safe_name = _safe_filename(f.filename)
         ext = os.path.splitext(safe_name)[1].lower()
@@ -424,54 +425,22 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
             print(f"upload write error for {safe_name}: {e}")
             continue
         if ext == ".pdf":
-            import fitz
-            from PIL import Image as PILImage
-            doc = fitz.open(dest)
-            if len(doc) > 200:
-                doc.close()
+            # Cheap pre-check (open + len) so we can reject oversize PDFs synchronously
+            try:
+                import fitz
+                _probe = fitz.open(dest)
+                page_count = len(_probe)
+                _probe.close()
+            except Exception as _e:
+                print(f"[pdf] open failed for {safe_name}: {_e}")
+                page_count = 0
+            if page_count > 200:
                 try: os.remove(dest)
                 except Exception: pass
-                raise HTTPException(413, f"PDF {safe_name}: too many pages ({len(doc)} > 200)")
-            base_name = os.path.splitext(safe_name)[0]
-            for i, page in enumerate(doc, start=1):
-                pix = page.get_pixmap(dpi=200)
-                img = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                page_name = f"{base_name}_page{i}.jpg"
-                page_dest = os.path.join(batch_dir, page_name)
-                img.save(page_dest, format="JPEG", quality=90)
-                db.queue_add(batch_id, page_name, page_dest, owner_uuid=user["uuid"], trade_show=trade_show)
-                try:
-                    storage.save_file(upload_key(batch_id, page_name), page_dest, "image/jpeg")
-                except Exception as _se:
-                    print(f"[storage] mirror failed for {page_name}: {_se}")
-                queued.append(page_name)
-
-                # Tier B: extract embedded images on this page (skipped from queue —
-                # they are enrichment thumbnails, not LLM-extracted documents).
-                try:
-                    img_refs = page.get_images(full=True)
-                    for j, ref in enumerate(img_refs[:20], start=1):  # cap 20/page
-                        xref = ref[0]
-                        try:
-                            pix2 = fitz.Pixmap(doc, xref)
-                            if pix2.n - pix2.alpha >= 4:  # CMYK or weird
-                                pix2 = fitz.Pixmap(fitz.csRGB, pix2)
-                            if pix2.width < 80 or pix2.height < 80:
-                                pix2 = None
-                                continue
-                            emb_name = f"{base_name}_page{i}_emb{j}.jpg"
-                            emb_dest = os.path.join(batch_dir, emb_name)
-                            pix2.save(emb_dest, "jpeg")
-                            pix2 = None
-                            try:
-                                storage.save_file(upload_key(batch_id, emb_name), emb_dest, "image/jpeg")
-                            except Exception:
-                                pass
-                        except Exception as _ee:
-                            print(f"[pdf] embedded extract failed page {i} img {j}: {_ee}")
-                except Exception as _ge:
-                    print(f"[pdf] get_images failed on page {i}: {_ge}")
-            doc.close()
+                raise HTTPException(413, f"PDF {safe_name}: too many pages ({page_count} > 200)")
+            # Defer expensive rasterization to background task so upload returns fast
+            pdf_jobs.append({"dest": dest, "safe_name": safe_name, "page_count": page_count})
+            queued.append(safe_name)
         else:
             db.queue_add(batch_id, safe_name, dest, owner_uuid=user["uuid"], trade_show=trade_show)
             try:
@@ -480,9 +449,16 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
                 print(f"[storage] mirror failed for {safe_name}: {_se}")
             queued.append(safe_name)
 
-    # Auto-process in background after upload
+    # Auto-process — fire-and-forget so response returns immediately even
+    # for huge PDFs. Starlette's BackgroundTasks holds the connection until
+    # tasks finish on some uvicorn versions; asyncio.create_task does not.
     if queued:
-        bg.add_task(_process_batch, batch_id, user["uuid"], client_meta)
+        if pdf_jobs:
+            asyncio.create_task(_split_pdfs_then_process(
+                batch_id, user["uuid"], pdf_jobs, batch_dir, trade_show, client_meta
+            ))
+        else:
+            asyncio.create_task(_process_batch(batch_id, user["uuid"], client_meta))
 
     # Audit log (best-effort, per-file)
     for fname in queued:
@@ -494,6 +470,7 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
         "queued": len(queued),
         "files": queued,
         "skipped": skipped,
+        "pdf_pages_pending": sum(j.get("page_count", 0) for j in pdf_jobs) if pdf_jobs else 0,
         "auto_processing": True,
     }
 
@@ -600,6 +577,86 @@ def queue_pending(batch_id: str = None, user=Depends(current_user)):
         return rows
     uid = user["uuid"]
     return [r for r in rows if r.get("owner_uuid") == uid]
+
+
+# ─── PDF SPLIT (background) — rasterize PDF pages + extract embedded images ───
+
+async def _split_pdfs_then_process(
+    batch_id: str,
+    owner_uuid: str,
+    pdf_jobs: list,
+    batch_dir: str,
+    trade_show: str = None,
+    client_meta: dict = None,
+):
+    """Heavy PDF rasterization runs here, not in the upload request handler.
+
+    Each PDF page becomes a JPEG queued for normal extraction. Embedded
+    images on each page are saved as enrichment thumbnails (not queued).
+    After all PDFs are split, kick off the regular processing pipeline.
+    """
+    import fitz
+    from PIL import Image as PILImage
+
+    for job in pdf_jobs:
+        dest = job.get("dest")
+        safe_name = job.get("safe_name")
+        if not dest or not os.path.isfile(dest):
+            continue
+        base_name = os.path.splitext(safe_name)[0]
+        try:
+            doc = fitz.open(dest)
+        except Exception as e:
+            print(f"[pdf-bg] open failed for {safe_name}: {e}")
+            continue
+        try:
+            for i, page in enumerate(doc, start=1):
+                try:
+                    pix = page.get_pixmap(dpi=200)
+                    img = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    page_name = f"{base_name}_page{i}.jpg"
+                    page_dest = os.path.join(batch_dir, page_name)
+                    img.save(page_dest, format="JPEG", quality=90)
+                    db.queue_add(batch_id, page_name, page_dest,
+                                 owner_uuid=owner_uuid, trade_show=trade_show)
+                    try:
+                        storage.save_file(upload_key(batch_id, page_name), page_dest, "image/jpeg")
+                    except Exception as _se:
+                        print(f"[storage] mirror failed for {page_name}: {_se}")
+                except Exception as _pe:
+                    print(f"[pdf-bg] page {i} render failed: {_pe}")
+                    continue
+
+                # Embedded image enrichment (cap 20/page, skip tiny)
+                try:
+                    img_refs = page.get_images(full=True)
+                    for j, ref in enumerate(img_refs[:20], start=1):
+                        xref = ref[0]
+                        try:
+                            pix2 = fitz.Pixmap(doc, xref)
+                            if pix2.n - pix2.alpha >= 4:
+                                pix2 = fitz.Pixmap(fitz.csRGB, pix2)
+                            if pix2.width < 80 or pix2.height < 80:
+                                pix2 = None
+                                continue
+                            emb_name = f"{base_name}_page{i}_emb{j}.jpg"
+                            emb_dest = os.path.join(batch_dir, emb_name)
+                            pix2.save(emb_dest, "jpeg")
+                            pix2 = None
+                            try:
+                                storage.save_file(upload_key(batch_id, emb_name), emb_dest, "image/jpeg")
+                            except Exception:
+                                pass
+                        except Exception as _ee:
+                            print(f"[pdf-bg] embedded extract failed p{i} img{j}: {_ee}")
+                except Exception as _ge:
+                    print(f"[pdf-bg] get_images failed p{i}: {_ge}")
+        finally:
+            try: doc.close()
+            except Exception: pass
+
+    # Now run the normal LLM processing on everything that was queued
+    await _process_batch(batch_id, owner_uuid, client_meta)
 
 
 # ─── PROCESS (runs extraction on pending queue items) ───

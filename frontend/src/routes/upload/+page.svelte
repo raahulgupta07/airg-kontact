@@ -164,9 +164,8 @@
     return results;
   }
 
-  // Upload phases (drives overlay)
-  type Phase = 'idle' | 'compressing' | 'uploading';
-  let phase = $state<Phase>('idle');
+  // Upload phases (drives overlay): 'idle' | 'compressing' | 'uploading'
+  let phase = $state('idle');
   let compressDone = $state(0);
   let compressTotal = $state(0);
 
