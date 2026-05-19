@@ -171,7 +171,45 @@ async def logout(response: Response, user=Depends(current_user)):
 
 @app.get("/api/auth/me")
 async def me(user=Depends(current_user)):
-    return {k: user[k] for k in ("uuid", "name", "email", "phone_e164", "role")}
+    # Include created_at + last_login for the profile page
+    with db.db() as c:
+        row = db.get_user_by_uuid(c, user["uuid"])
+    return {
+        "uuid": user["uuid"],
+        "name": user["name"],
+        "email": user["email"],
+        "phone_e164": user["phone_e164"],
+        "role": user["role"],
+        "created_at": row["created_at"] if row else None,
+        "last_login": row["last_login"] if row else None,
+    }
+
+
+@app.post("/api/auth/change-password")
+@(limiter.limit("10/minute") if limiter else (lambda f: f))
+async def change_password(payload: dict, request: Request, user=Depends(current_user)):
+    """Self-service password change. Requires current_password.
+    Body: {current_password, new_password}
+    """
+    current = (payload.get("current_password") or "").strip()
+    new = (payload.get("new_password") or "").strip()
+    if not current or not new:
+        raise HTTPException(400, "current_password and new_password required")
+    if len(new) < 8:
+        raise HTTPException(400, "new_password must be at least 8 characters")
+    if new == current:
+        raise HTTPException(400, "new_password must differ from current_password")
+    with db.db() as c:
+        row = db.get_user_by_uuid(c, user["uuid"])
+        if not row or not row["is_active"]:
+            raise HTTPException(401, "user not found or disabled")
+        if not row["password_hash"] or not verify_secret(current, row["password_hash"]):
+            db.log_event_safe("change_password_fail", "user", user["uuid"], user["uuid"])
+            raise HTTPException(401, "current password is incorrect")
+        new_hash = hash_secret(new)
+        db.update_user(c, user["uuid"], {"password_hash": new_hash})
+    db.log_event_safe("change_password", "user", user["uuid"], user["uuid"])
+    return {"ok": True}
 
 
 @app.get("/api/users")
@@ -236,10 +274,16 @@ async def users_update(target_uuid: str, payload: dict, user=Depends(current_use
     if "email" in updates and updates["email"]:
         updates["email"] = updates["email"].strip().lower()
     if "password" in payload and payload["password"]:
+        # Admins can reset any password directly. Self-service password change
+        # MUST go through /api/auth/change-password (requires current password).
+        if not is_admin:
+            raise HTTPException(403, "use /api/auth/change-password to change your own password")
         updates["password_hash"] = hash_secret(payload["password"])
     if "pin" in payload and payload["pin"]:
         if not payload["pin"].isdigit() or len(payload["pin"]) != 4:
             raise HTTPException(400, "pin must be 4 digits")
+        if not is_admin:
+            raise HTTPException(403, "only admin can set PIN")
         updates["pin_hash"] = hash_secret(payload["pin"])
     if is_admin:
         if "role" in payload and payload["role"] in ("admin", "user"):

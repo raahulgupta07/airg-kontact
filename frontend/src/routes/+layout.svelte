@@ -182,18 +182,27 @@
     <div class="sidebar-footer">
       {#if auth.user}
         <div class="user-card">
-          <div class="user-name" title={auth.user.name}>{auth.user.name}</div>
-          <div class="user-meta" title={auth.user.email || auth.user.phone_e164 || ''}>
-            {auth.user.email || auth.user.phone_e164 || ''}
-          </div>
-          <button class="btn-ghost xs signout-btn" onclick={onSignOut}>
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
-              <polyline points="16 17 21 12 16 7"/>
-              <line x1="21" y1="12" x2="9" y2="12"/>
-            </svg>
-            Sign out
+          <button class="user-link" onclick={() => navigateTo('/profile')} title="View profile">
+            <div class="user-name">{auth.user.name}</div>
+            <div class="user-meta">{auth.user.email || auth.user.phone_e164 || ''}</div>
           </button>
+          <div class="user-actions">
+            <button class="btn-ghost xs" onclick={() => navigateTo('/profile')} title="Profile">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                <circle cx="12" cy="7" r="4"/>
+              </svg>
+              Profile
+            </button>
+            <button class="btn-ghost xs signout-btn" onclick={onSignOut}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                <polyline points="16 17 21 12 16 7"/>
+                <line x1="21" y1="12" x2="9" y2="12"/>
+              </svg>
+              Sign out
+            </button>
+          </div>
         </div>
       {/if}
 
@@ -553,6 +562,26 @@
       gap: 6px;
       margin-top: 4px;
       padding: 6px 10px;
+      font-size: 12px;
+      min-height: 30px;
+      border-radius: var(--r-sm);
+    }
+    .user-link {
+      background: none; border: none; padding: 0; cursor: pointer;
+      text-align: left; width: 100%;
+      font-family: inherit;
+    }
+    .user-link:hover .user-name { color: var(--accent); }
+    .user-actions {
+      display: flex; gap: 6px; margin-top: 6px;
+    }
+    .user-actions .btn-ghost {
+      flex: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      padding: 6px 8px;
       font-size: 12px;
       min-height: 30px;
       border-radius: var(--r-sm);

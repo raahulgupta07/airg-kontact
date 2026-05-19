@@ -16,6 +16,53 @@
   let saving = $state(false);
   let err = $state('');
 
+  // Reset password modal
+  let resetTarget = $state<UserRow | null>(null);
+  let resetPw = $state('');
+  let resetBusy = $state(false);
+  let resetMsg = $state('');
+
+  function openReset(u: UserRow) {
+    resetTarget = u;
+    resetPw = '';
+    resetMsg = '';
+  }
+  function closeReset() { resetTarget = null; }
+  function genPw() {
+    // 14-char random URL-safe
+    const chars = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$';
+    let s = '';
+    for (let i = 0; i < 14; i++) s += chars[Math.floor(Math.random() * chars.length)];
+    resetPw = s;
+  }
+  async function submitReset() {
+    if (!resetTarget || resetPw.length < 8) {
+      resetMsg = 'Password must be at least 8 characters.';
+      return;
+    }
+    resetBusy = true;
+    resetMsg = '';
+    try {
+      const r = await fetch(`/api/users/${resetTarget.uuid}`, {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: resetPw }),
+      });
+      if (r.ok) {
+        resetMsg = `OK — give this password to ${resetTarget.name}: ${resetPw}`;
+        // Don't auto-close — admin needs to copy
+      } else {
+        const e = await r.json().catch(() => ({}));
+        resetMsg = e.detail || `Failed (${r.status})`;
+      }
+    } catch {
+      resetMsg = 'Network error';
+    } finally {
+      resetBusy = false;
+    }
+  }
+
   type FormShape = {
     name: string;
     email: string;
@@ -267,6 +314,7 @@
                   {:else}
                     <div class="row-actions">
                       <button class="btn-ghost xs" onclick={() => openEdit(u)}>Edit</button>
+                      <button class="btn-ghost xs" onclick={() => openReset(u)} title="Reset password">Reset PW</button>
                       {#if !isSelf && u.role !== 'super_admin'}
                         <button class="btn-ghost xs danger" onclick={() => del(u)}>Delete</button>
                       {/if}
@@ -364,6 +412,41 @@
           </button>
         </footer>
       </form>
+    </div>
+  </div>
+{/if}
+
+{#if resetTarget}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={closeReset}>
+    <div class="modal-card" onclick={(e) => e.stopPropagation()}>
+      <h3 class="modal-title">Reset password</h3>
+      <p class="modal-sub">for <b>{resetTarget.name}</b> ({resetTarget.email})</p>
+
+      <label class="field">
+        <span>New password</span>
+        <input
+          type="text"
+          bind:value={resetPw}
+          minlength="8"
+          placeholder="At least 8 characters"
+          class="input"
+        />
+      </label>
+
+      <div class="reset-actions">
+        <button class="btn-ghost" type="button" onclick={genPw}>Generate</button>
+        <div class="spacer"></div>
+        <button class="btn-ghost" type="button" onclick={closeReset}>Cancel</button>
+        <button class="send-btn" type="button" disabled={resetBusy || resetPw.length < 8} onclick={submitReset}>
+          {resetBusy ? 'Saving…' : 'Reset'}
+        </button>
+      </div>
+
+      {#if resetMsg}
+        <div class="banner-info">{resetMsg}</div>
+      {/if}
     </div>
   </div>
 {/if}
@@ -498,5 +581,35 @@
 
   @media (max-width: 520px) {
     .mrow { grid-template-columns: 1fr; }
+  }
+
+  /* Reset-password modal */
+  .modal-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    padding: 22px;
+    width: 100%;
+    max-width: 420px;
+  }
+  .modal-title { margin: 0; font-size: 17px; }
+  .modal-sub { color: var(--text-muted); font-size: 13px; margin: 4px 0 14px; }
+  .reset-actions {
+    display: flex; gap: 8px; align-items: center; margin-top: 4px;
+  }
+  .reset-actions .spacer { flex: 1; }
+  .reset-actions .btn-ghost, .reset-actions .send-btn {
+    padding: 8px 14px;
+  }
+  .banner-info {
+    margin-top: 14px;
+    padding: 10px 12px;
+    background: var(--accent-soft, rgba(201,100,66,0.1));
+    border: 1px solid var(--accent);
+    color: var(--text);
+    border-radius: var(--r-md);
+    font-size: 12px;
+    word-break: break-all;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
   }
 </style>
