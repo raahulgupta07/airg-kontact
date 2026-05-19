@@ -381,8 +381,10 @@
           }
         };
         xhr.onerror = () => reject(new Error('Network error during upload'));
+        xhr.ontimeout = () => reject(new Error('Server response timed out'));
         xhr.open('POST', '/api/upload');
         xhr.withCredentials = true;
+        xhr.timeout = 120_000;  // 2 min safety — abort if server hangs
         xhr.send(formData);
       });
       result = res;
@@ -443,30 +445,43 @@
     {@const displayPct = phase === 'compressing'
         ? (compressTotal > 0 ? Math.round((compressDone / compressTotal) * 100) : 0)
         : uploadProgress}
+    {@const finalizing = phase === 'uploading' && uploadProgress >= 100}
     <div class="upload-overlay" role="status" aria-live="polite">
       <div class="upload-overlay-inner">
-        <div class="upload-ring">
+        <div class="upload-ring" class:spin={finalizing}>
           <svg viewBox="0 0 100 100" width="120" height="120" aria-hidden="true">
             <circle class="ring-bg" cx="50" cy="50" r="44" />
             <circle
               class="ring-fg"
               cx="50" cy="50" r="44"
               stroke-dasharray="276.46"
-              stroke-dashoffset={276.46 - (276.46 * displayPct / 100)}
+              stroke-dashoffset={finalizing ? 70 : (276.46 - (276.46 * displayPct / 100))}
             />
           </svg>
-          <div class="upload-pct">{displayPct}%</div>
+          {#if finalizing}
+            <div class="upload-pct" style="font-size:14px;">Finalizing</div>
+          {:else}
+            <div class="upload-pct">{displayPct}%</div>
+          {/if}
         </div>
         <p class="upload-line">
           {#if phase === 'compressing'}
             Compressing {compressDone}/{compressTotal}…
+          {:else if finalizing}
+            Server is finalizing your upload…
           {:else if phase === 'uploading'}
             Uploading {files.length} file{files.length !== 1 ? 's' : ''}…
           {:else}
             Preparing…
           {/if}
         </p>
-        <p class="upload-sub">Don't leave this page yet</p>
+        <p class="upload-sub">
+          {#if finalizing}
+            Almost done — just a moment
+          {:else}
+            Don't leave this page yet
+          {/if}
+        </p>
       </div>
     </div>
   {/if}
@@ -1040,6 +1055,13 @@
   }
   .upload-ring svg {
     transform: rotate(-90deg);
+  }
+  .upload-ring.spin svg {
+    animation: upload-ring-spin 1s linear infinite;
+  }
+  @keyframes upload-ring-spin {
+    from { transform: rotate(-90deg); }
+    to   { transform: rotate(270deg); }
   }
   .upload-ring .ring-bg {
     fill: none;
