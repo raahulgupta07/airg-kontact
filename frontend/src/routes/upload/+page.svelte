@@ -310,6 +310,27 @@
     </div>
   {/if}
 
+  {#if uploading === 'uploading'}
+    <div class="upload-overlay" role="status" aria-live="polite">
+      <div class="upload-overlay-inner">
+        <div class="upload-ring">
+          <svg viewBox="0 0 100 100" width="120" height="120" aria-hidden="true">
+            <circle class="ring-bg" cx="50" cy="50" r="44" />
+            <circle
+              class="ring-fg"
+              cx="50" cy="50" r="44"
+              stroke-dasharray="276.46"
+              stroke-dashoffset={276.46 - (276.46 * uploadProgress / 100)}
+            />
+          </svg>
+          <div class="upload-pct">{uploadProgress}%</div>
+        </div>
+        <p class="upload-line">Uploading {files.length} file{files.length !== 1 ? 's' : ''}…</p>
+        <p class="upload-sub">Don't leave this page yet</p>
+      </div>
+    </div>
+  {/if}
+
   {#if uploading === 'done' && result}
     <div class="success-block card">
       <div class="success-icon">&#10003;</div>
@@ -821,5 +842,70 @@
   .success-actions {
     display: flex; gap: 8px; margin-top: 8px;
     flex-wrap: wrap; justify-content: center;
+  }
+
+  /* Upload progress overlay (full-page) */
+  .upload-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    z-index: 150;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .upload-overlay-inner {
+    background: var(--surface);
+    border-radius: var(--r-lg);
+    padding: 28px 24px;
+    max-width: 340px;
+    width: 100%;
+    text-align: center;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.4);
+  }
+  .upload-ring {
+    position: relative;
+    width: 120px;
+    height: 120px;
+    margin: 0 auto 14px;
+  }
+  .upload-ring svg {
+    transform: rotate(-90deg);
+  }
+  .upload-ring .ring-bg {
+    fill: none;
+    stroke: var(--border);
+    stroke-width: 8;
+  }
+  .upload-ring .ring-fg {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 8;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 0.25s ease;
+  }
+  .upload-pct {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text);
+    font-family: var(--font-serif, Georgia, serif);
+  }
+  .upload-line {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+    margin: 0;
+  }
+  .upload-sub {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 4px 0 0;
   }
 </style>

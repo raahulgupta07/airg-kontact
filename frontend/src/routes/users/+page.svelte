@@ -140,28 +140,25 @@
     e.preventDefault();
     if (saving) return;
 
-    // Light client-side validation
-    if (form.pin && !/^\d{4}$/.test(form.pin)) {
-      err = 'PIN must be exactly 4 digits';
+    // Email + password only on UI (phone/PIN columns kept in backend but not exposed)
+    if (!editing && !form.password) {
+      err = 'Set a password';
       return;
     }
-    if (!editing && !form.password && !form.pin) {
-      err = 'Set a password or PIN';
+    if (form.password && form.password.length < 8) {
+      err = 'Password must be at least 8 characters';
       return;
     }
 
     saving = true;
     err = '';
 
-    // For PATCH, only include fields that changed / are non-empty
     const payload: Record<string, unknown> = {
       name: form.name,
       email: form.email || null,
-      phone: form.phone || null,
       role: form.role
     };
     if (form.password) payload.password = form.password;
-    if (form.pin) payload.pin = form.pin;
 
     const url = editing ? `/api/users/${editing.uuid}` : '/api/users';
     const method = editing ? 'PATCH' : 'POST';
@@ -280,7 +277,6 @@
             <tr>
               <th>Name</th>
               <th>Email</th>
-              <th>Phone</th>
               <th>Role</th>
               <th>Last login</th>
               <th class="actions-col">Actions</th>
@@ -296,7 +292,6 @@
                   {#if isSelf}<span class="chip chip-accent self-chip">You</span>{/if}
                 </td>
                 <td class="muted-cell">{u.email || '—'}</td>
-                <td class="muted-cell">{u.phone_e164 || '—'}</td>
                 <td>
                   <span class="chip" class:chip-accent={u.role !== 'user'}>
                     {roleLabel(u.role)}
@@ -357,38 +352,20 @@
         <div class="mrow">
           <label class="mfield">
             <span>Email</span>
-            <input class="input" type="email" bind:value={form.email} autocomplete="email" placeholder="optional" />
-          </label>
-          <label class="mfield">
-            <span>Phone</span>
-            <input class="input" type="tel" bind:value={form.phone} autocomplete="tel" placeholder="+95…" />
+            <input class="input" type="email" bind:value={form.email} autocomplete="email" required placeholder="user@domain.com" />
           </label>
         </div>
 
-        <div class="mrow">
-          <label class="mfield">
-            <span>{editing ? 'New password' : 'Password'}</span>
-            <input
-              class="input"
-              type="password"
-              bind:value={form.password}
-              autocomplete="new-password"
-              placeholder={editing ? 'leave blank to keep' : 'min 8 chars'}
-            />
-          </label>
-          <label class="mfield">
-            <span>{editing ? 'New PIN' : 'PIN'}</span>
-            <input
-              class="input"
-              type="text"
-              inputmode="numeric"
-              pattern="[0-9]{'{'}4{'}'}"
-              maxlength="4"
-              bind:value={form.pin}
-              placeholder={editing ? 'leave blank' : '4 digits'}
-            />
-          </label>
-        </div>
+        <label class="mfield">
+          <span>{editing ? 'New password' : 'Password'}</span>
+          <input
+            class="input"
+            type="password"
+            bind:value={form.password}
+            autocomplete="new-password"
+            placeholder={editing ? 'leave blank to keep' : 'min 8 chars'}
+          />
+        </label>
 
         <label class="mfield">
           <span>Role</span>
