@@ -80,6 +80,48 @@
 
   function showToast(msg) { toast = msg; setTimeout(() => toast = '', 2400); }
 
+  // ── Double-confirm delete ──────────────────────────────────────────
+  let deleteTarget = $state(null);       // doc pending delete
+  let deleteConfirmText = $state('');    // user must type DELETE
+  let deleting = $state(false);
+
+  function requestDelete(doc) {
+    deleteTarget = doc;
+    deleteConfirmText = '';
+  }
+  function cancelDelete() { deleteTarget = null; deleteConfirmText = ''; }
+
+  async function confirmDelete() {
+    if (!deleteTarget || deleteConfirmText.trim().toUpperCase() !== 'DELETE') return;
+    deleting = true;
+    try {
+      const r = await fetch(`/api/documents/${deleteTarget.uuid}`, {
+        method: 'DELETE', credentials: 'include',
+      });
+      if (r.ok) {
+        showToast('Deleted');
+        // remove from local lists
+        docs = docs.filter(d => d.uuid !== deleteTarget.uuid);
+        applyFilters();
+        deleteTarget = null;
+        deleteConfirmText = '';
+      } else if (r.status === 403) {
+        showToast('Not allowed — only the uploader or an admin can delete');
+      } else if (r.status === 404) {
+        showToast('Already deleted');
+        docs = docs.filter(d => d.uuid !== deleteTarget.uuid);
+        applyFilters();
+        deleteTarget = null;
+      } else {
+        showToast('Delete failed: ' + r.status);
+      }
+    } catch (e) {
+      showToast('Delete error: ' + e.message);
+    } finally {
+      deleting = false;
+    }
+  }
+
   // Editor opened from card view (uses doc + nested contact)
   function openContactEditor(doc) {
     const c = doc.contact || {};
@@ -627,6 +669,7 @@
                   {#if doc.contact && (doc.contact.phone || doc.contact.email || doc.contact.person)}
                     <button class="btn-ghost sm" onclick={() => doDownloadVcard(doc.contact?.uuid || doc.uuid)}>Download .vcf</button>
                   {/if}
+                  <button class="btn-danger sm" onclick={() => requestDelete(doc)}>🗑 Delete</button>
                 </div>
 
                 <div class="detail-section">
@@ -784,6 +827,36 @@
 
 {#if toast}
   <div class="toast">{toast}</div>
+{/if}
+
+{#if deleteTarget}
+  <div class="modal-backdrop" onclick={cancelDelete} role="button" tabindex="-1" onkeydown={(e) => e.key === 'Escape' && cancelDelete()}>
+    <div class="modal del-modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-label="Confirm delete">
+      <h3>⚠️ Delete this document?</h3>
+      <p class="del-name">{deleteTarget.title || deleteTarget.company || deleteTarget.source_file || deleteTarget.uuid?.slice(0,8)}</p>
+      <p class="del-warn">
+        This permanently removes the document, its products, contacts, image file, and search index entry.
+        <strong>This cannot be undone.</strong>
+      </p>
+      <p class="del-prompt">Type <code>DELETE</code> to confirm:</p>
+      <input
+        class="input"
+        type="text"
+        bind:value={deleteConfirmText}
+        placeholder="DELETE"
+        autocomplete="off"
+        onkeydown={(e) => { if (e.key === 'Enter' && deleteConfirmText.trim().toUpperCase() === 'DELETE') confirmDelete(); }}
+      />
+      <div class="del-actions">
+        <button class="btn-ghost" onclick={cancelDelete}>Cancel</button>
+        <button
+          class="btn-danger"
+          disabled={deleting || deleteConfirmText.trim().toUpperCase() !== 'DELETE'}
+          onclick={confirmDelete}
+        >{deleting ? 'Deleting…' : 'Delete permanently'}</button>
+      </div>
+    </div>
+  </div>
 {/if}
 
 {#if editContact}
@@ -1125,6 +1198,22 @@
   }
   .btn-ghost.sm { padding: 6px 12px; font-size: 12px; min-height: 30px; }
   .btn-ghost.xs { padding: 3px 8px; font-size: 11px; min-height: 24px; }
+  .btn-danger {
+    padding: 8px 14px; border-radius: var(--r-sm); cursor: pointer; font-family: inherit;
+    background: transparent; border: 1px solid #d4564b; color: #d4564b; font-weight: 600;
+  }
+  .btn-danger:hover:not(:disabled) { background: #d4564b; color: white; }
+  .btn-danger.sm { padding: 6px 12px; font-size: 12px; min-height: 30px; }
+  .btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .del-modal { max-width: 420px; padding: 24px; }
+  .del-modal h3 { margin: 0 0 12px; font-size: 17px; }
+  .del-name { font-weight: 600; padding: 8px 10px; background: var(--surface-2, rgba(0,0,0,0.04)); border-radius: var(--r-sm); margin: 0 0 12px; word-break: break-word; }
+  .del-warn { font-size: 13px; color: var(--text-muted); line-height: 1.5; margin: 0 0 14px; }
+  .del-warn strong { color: #d4564b; }
+  .del-prompt { font-size: 13px; margin: 0 0 6px; }
+  .del-prompt code { background: var(--surface-2, rgba(0,0,0,0.06)); padding: 1px 6px; border-radius: 4px; font-weight: 700; }
+  .del-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
 
   .detail-section { margin-bottom: 16px; }
   .detail-section h4 {

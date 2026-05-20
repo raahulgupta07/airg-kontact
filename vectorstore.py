@@ -169,6 +169,19 @@ def delete_by_folder(folder: str) -> int:
         return 0
 
 
+def delete_by_doc(folder: str, source_file: str) -> int:
+    """Delete vectors for ONE document only (not the whole folder/batch)."""
+    try:
+        collection.delete(where={"$and": [
+            {"folder": {"$eq": folder}},
+            {"source_file": {"$eq": source_file}},
+        ]})
+        return 1
+    except Exception:
+        # Fallback: older chroma without $and — best-effort by folder skipped
+        return 0
+
+
 def index_all_from_json():
     reset_collection()
     ext_dir = config.EXTRACTIONS_DIR

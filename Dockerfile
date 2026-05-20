@@ -20,4 +20,8 @@ COPY --from=frontend /build/build /app/frontend/build
 ENV PORT=8000
 EXPOSE ${PORT}
 HEALTHCHECK --interval=30s --timeout=5s CMD curl -f http://localhost:${PORT}/health || exit 1
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers ${UVICORN_WORKERS:-4}
+# Single worker: ChromaDB PersistentClient is single-process only — multiple
+# workers corrupt/deadlock its SQLite store. Concurrency comes from FastAPI's
+# threadpool (sync `def` routes) + asyncio.to_thread for blocking calls in
+# async routes. To scale past this, run ChromaDB in server mode + HttpClient.
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers ${UVICORN_WORKERS:-1}

@@ -601,6 +601,44 @@ def delete_batch(batch_id: str, user=Depends(current_user)):
     return {"deleted": batch_id, "count": count}
 
 
+@app.delete("/api/documents/{doc_uuid}")
+def delete_document_endpoint(doc_uuid: str, user=Depends(current_user)):
+    """Delete a single document (card) + its products/contacts/tags/vector/file.
+    Allowed only for the owner (uploader) or an admin/super_admin."""
+    doc = db.get_document(doc_uuid)
+    if not doc:
+        raise HTTPException(404, "document not found")
+    if not db.can_edit(doc, user):
+        raise HTTPException(403, "not allowed — owner or admin only")
+
+    folder = doc.get("folder")
+    source_file = doc.get("source_file")
+    result = db.delete_document(doc_uuid)
+    if not result.get("deleted"):
+        raise HTTPException(404, "document not found")
+
+    # Cascade: ChromaDB vector (THIS doc only — not the whole batch folder)
+    try:
+        vs.delete_by_doc(folder, source_file)
+    except Exception as e:
+        print(f"[vs] delete_by_doc error: {e}")
+    try:
+        if folder and source_file:
+            storage.delete(upload_key(folder, source_file))
+            # also remove cached thumbnails for this file
+            import glob
+            thumb_dir = os.path.join(config.UPLOADS_DIR, folder, ".thumbs")
+            for tp in glob.glob(os.path.join(thumb_dir, f"*_{source_file.replace('/', '_')}.jpg")):
+                try: os.remove(tp)
+                except Exception: pass
+    except Exception as e:
+        print(f"[storage] delete doc file error: {e}")
+
+    db.log_event_safe("delete", "document", doc_uuid, user["uuid"],
+                      detail={"folder": folder, "source_file": source_file})
+    return {"deleted": doc_uuid}
+
+
 @app.get("/api/queue/pending")
 def queue_pending(batch_id: str = None, user=Depends(current_user)):
     rows = db.queue_pending(batch_id)

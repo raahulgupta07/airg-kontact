@@ -2084,6 +2084,38 @@ def delete_batch(batch_id: str) -> int:
     return queue_deleted + doc_deleted
 
 
+def get_document(doc_uuid: str) -> dict | None:
+    c = _conn()
+    try:
+        row = c.execute("SELECT * FROM documents WHERE uuid = ?", (doc_uuid,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        c.close()
+
+
+def delete_document(doc_uuid: str) -> dict:
+    """Delete one document + its products/contacts/tags. Returns {folder, source_file, deleted}."""
+    c = _conn()
+    try:
+        row = c.execute(
+            "SELECT id, folder, source_file FROM documents WHERE uuid = ?", (doc_uuid,)
+        ).fetchone()
+        if not row:
+            return {"deleted": 0}
+        doc_id, folder, source_file = row["id"], row["folder"], row["source_file"]
+        c.execute("DELETE FROM products WHERE document_uuid = ?", (doc_uuid,))
+        c.execute("DELETE FROM contacts WHERE document_uuid = ?", (doc_uuid,))
+        try:
+            c.execute("DELETE FROM document_tags WHERE document_uuid = ?", (doc_uuid,))
+        except Exception:
+            pass
+        n = c.execute("DELETE FROM documents WHERE uuid = ?", (doc_uuid,)).rowcount
+        c.commit()
+        return {"deleted": n, "folder": folder, "source_file": source_file}
+    finally:
+        c.close()
+
+
 def queue_batches(user: dict = None) -> list:
     c = _conn()
     where = ""
