@@ -8,6 +8,10 @@ Multi-tenant. Hardened. Production-shape. One-tap mobile. Installable PWA (Andro
 
 ## What's new
 
+- **Multi-user stability** — global write-lock serializes SQLite writes; no more "database is locked" under concurrent uploads/logins. Single worker + threadpool (ChromaDB is single-process; see Dockerfile note to scale)
+- **Delete** — per-card delete with double-confirm (type DELETE), owner-or-admin only; cascades products/contacts/vector/file
+- **Camera fix** — generic filenames (`image.jpg`) no longer silently rejected
+- **Chat guardrails** — answers only catalog data; blocks prompt-injection
 - **Company auto-fill** — cascade resolver (contact → doc → product → website → email domain) + nightly/on-demand backfill jobs
 - **Duplicate cleanup** — cluster view groups duplicates, one-click "merge all into master", human-approved (no silent deletes), 7-tier scanner (file hash / perceptual hash / filename / phone / email / company+person)
 - **Admin Insights** (Settings → Admin) — LLM cost dashboard, usage heatmap, conversion funnel, run nightly jobs on-demand, **edit cron schedule live** (no restart)

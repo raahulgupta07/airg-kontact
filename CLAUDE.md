@@ -6,7 +6,31 @@ Internal reference for working on KONTACT. Read this before making changes.
 
 **Multi-tenant catalog vision RAG agent** — trade-show team uploads catalog photos + business-card QRs, extractors structure the data, agent answers SQL-aware questions about who-met-where.
 
-**Status**: Production-shape. See "Hardening landmarks" + "Session 2 additions" below.
+**Status**: Production-shape. See "Hardening landmarks" + "Session 2 additions" + "Session 3 fixes" below.
+
+## Session 3 fixes (concurrency, delete, camera, guardrails)
+
+### Concurrency / cloud stability (CRITICAL)
+- **Global write lock** (`database.write_lock()` + `@serialized_write`): SQLite has one writer; under FastAPI's threadpool many concurrent write threads collided → `database is locked`. All hot writers now serialize: `queue_add`, `insert_extraction`, `upsert_contact`, `save_chat`, `queue_update/delete`, `delete_document`, `delete_batch`, backfill `_apply_update`, `auth.record_login_attempt`. Reads stay concurrent (WAL). `busy_timeout` 60s.
+- **Single uvicorn worker** (Dockerfile, `UVICORN_WORKERS` default 1): ChromaDB `PersistentClient` is single-process — multiple workers deadlock its SQLite store. Concurrency comes from FastAPI threadpool (sync `def` routes) + `asyncio.to_thread`. Multi-worker needs ChromaDB server mode + `HttpClient`.
+- **Sync `def` for serve_image + serve_thumb**: PIL/DB on event loop froze all users; now threadpooled.
+- **DB pool 32** (`DB_POOL_SIZE`). **Runtime dirs created at import** (`config.py`: uploads/extractions/chroma) — fresh volumes were empty → `FileNotFoundError` writing extraction JSON.
+- Chat `_build_context` / `vs.query` / `save_chat` wrapped in `asyncio.to_thread` inside `ask()` + `/api/chat/stream`.
+
+### Delete
+- **Per-document delete**: `DELETE /api/documents/{uuid}` (owner-or-admin via `can_edit`), cascades products/contacts/tags + ChromaDB vector (`vs.delete_by_doc` — only THIS doc, not whole folder) + stored file + thumbnails. UI: 🗑 on each card → double-confirm modal (type DELETE).
+- **`delete_batch` FK fix**: deletes products/contacts/document_tags before documents (was `FOREIGN KEY constraint failed`).
+- **Auth on tag-detach + wechat-chat delete** (were unauthed): now owner-or-admin / admin.
+
+### Camera upload
+- Removed 24h filename-dedup guard — camera captures share generic names (`image.jpg`) so it silently rejected every photo after the first. True dups handled by file_hash + nightly dedup_scan.
+
+### Chat guardrails
+- Hard pre-filter `chat._is_injection_attempt()` (regex, no LLM): blocks ignore-instructions / reveal-prompt / role-change / DAN.
+- System-prompt SCOPE: answers only catalog data; refuses general knowledge/coding/opinions/news/roleplay.
+
+### UI
+- Contacts: UUID column hidden, sorted newest-created first. Cards tab: search box (company/person/product/file/text). Settings nav (was "More", admin-only) consolidates Tools/Stats/Users/Admin Insights.
 
 ## Session 2 additions (data quality, dedup, admin, guardrails, PWA)
 
