@@ -3,7 +3,7 @@
 
     # Larger upload limit for photos
     request_body {
-        max_size 100MB
+        max_size 250MB
     }
 
     reverse_proxy kontact:8090 {

@@ -289,14 +289,43 @@ def _quality_score(data: dict) -> float:
     return round(score, 3)
 
 
+# GLOBAL across all batches/users. Without this each concurrent batch made its
+# own Semaphore(MAX_WORKERS) → 10 users uploading = 10×MAX_WORKERS simultaneous
+# vision calls → OpenRouter 429 storm + memory spike. One shared semaphore caps
+# total in-flight LLM calls process-wide. Lazily created on the running loop.
+_GLOBAL_SEM: "asyncio.Semaphore | None" = None
+_CLIENT: "httpx.AsyncClient | None" = None
+
+
+def _get_sem() -> asyncio.Semaphore:
+    global _GLOBAL_SEM
+    if _GLOBAL_SEM is None:
+        _GLOBAL_SEM = asyncio.Semaphore(config.MAX_WORKERS)
+    return _GLOBAL_SEM
+
+
+def _get_client() -> httpx.AsyncClient:
+    """Reused client → connection pooling, no per-batch setup/teardown churn."""
+    global _CLIENT
+    if _CLIENT is None or _CLIENT.is_closed:
+        _CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0),
+            limits=httpx.Limits(
+                max_connections=config.MAX_WORKERS * 2,
+                max_keepalive_connections=config.MAX_WORKERS,
+            ),
+        )
+    return _CLIENT
+
+
 async def extract_batch(images: list, on_progress=None) -> list:
-    sem = asyncio.Semaphore(config.MAX_WORKERS)
+    sem = _get_sem()
+    client = _get_client()
     results = []
-    async with httpx.AsyncClient() as client:
-        tasks = [extract_one(client, img, sem) for img in images]
-        for i, coro in enumerate(asyncio.as_completed(tasks)):
-            result = await coro
-            results.append(result)
-            if on_progress:
-                on_progress(i + 1, len(images), result.get("source_file", ""))
+    tasks = [extract_one(client, img, sem) for img in images]
+    for i, coro in enumerate(asyncio.as_completed(tasks)):
+        result = await coro
+        results.append(result)
+        if on_progress:
+            on_progress(i + 1, len(images), result.get("source_file", ""))
     return sorted(results, key=lambda x: x.get("source_file", ""))

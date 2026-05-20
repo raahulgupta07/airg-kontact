@@ -7,12 +7,32 @@ services:
       - kontact-data:/app/data
     env_file:
       - .env
+    # CHROMA_HOST switches vectorstore to the shared Chroma server, which is
+    # what lets you run UVICORN_WORKERS > 1 (PersistentClient can't). Set
+    # UVICORN_WORKERS in .env (default 1). Override port via CHROMA_PORT.
+    environment:
+      - CHROMA_HOST=${CHROMA_HOST:-chroma}
+      - CHROMA_PORT=${CHROMA_PORT:-8000}
+    depends_on:
+      - chroma
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8000}/health"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+  # Shared vector DB. Single process, but ALL kontact workers talk to it over
+  # HTTP — so kontact can scale to multiple workers safely. Not published to
+  # the host; reachable only on the compose network as `chroma:8000`.
+  chroma:
+    image: chromadb/chroma:1.4.1
+    restart: unless-stopped
+    volumes:
+      - chroma-data:/data
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
 
   caddy:
     image: caddy:2-alpine
@@ -33,5 +53,6 @@ services:
 
 volumes:
   kontact-data:
+  chroma-data:
   caddy_data:
   caddy_config:

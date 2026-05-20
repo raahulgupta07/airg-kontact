@@ -112,6 +112,16 @@ def _bootstrap_auth():
         db.run_tenancy_backfill()
     except Exception as e:
         print(f"[tenancy] backfill error: {e}")
+    # Raise the anyio worker-thread cap (default 40). Sync `def` routes
+    # (serve_image/thumb) + asyncio.to_thread (load_image, persist, PDF
+    # raster, chat DB) all draw from this pool; under a big batch + browsing
+    # 40 can starve and stall requests. 64 gives headroom for ~20 users.
+    try:
+        import anyio
+        limiter_ = anyio.to_thread.current_default_thread_limiter()
+        limiter_.total_tokens = int(os.getenv("THREAD_POOL_SIZE", "64"))
+    except Exception as e:
+        print(f"[threadpool] limiter tune skipped: {e}")
 
 
 from typing import Optional
@@ -124,7 +134,9 @@ class ChatRequest(BaseModel):
 # ─── AUTH ───
 
 @app.post("/api/auth/login")
-@(limiter.limit("10/minute") if limiter else (lambda f: f))
+# 30/min/IP — a team behind one office NAT shares this IP, so 10/min throttled
+# concurrent logins. Per-account brute-force is still capped by is_locked().
+@(limiter.limit("30/minute") if limiter else (lambda f: f))
 async def login(payload: dict, request: Request, response: Response):
     # Accept identifier or legacy 'email' field. Email + password only.
     identifier = (payload.get("identifier") or payload.get("email") or "").strip()
@@ -485,11 +497,12 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
     # tasks finish on some uvicorn versions; asyncio.create_task does not.
     if queued:
         if pdf_jobs:
-            asyncio.create_task(_split_pdfs_then_process(
+            asyncio.create_task(_bg_guard(_split_pdfs_then_process(
                 batch_id, user["uuid"], pdf_jobs, batch_dir, trade_show, client_meta
-            ))
+            ), batch_id))
         else:
-            asyncio.create_task(_process_batch(batch_id, user["uuid"], client_meta))
+            asyncio.create_task(_bg_guard(
+                _process_batch(batch_id, user["uuid"], client_meta), batch_id))
 
     # Audit log (best-effort, per-file)
     for fname in queued:
@@ -648,6 +661,22 @@ def queue_pending(batch_id: str = None, user=Depends(current_user)):
     return [r for r in rows if r.get("owner_uuid") == uid]
 
 
+async def _bg_guard(coro, batch_id: str):
+    """Run a fire-and-forget processing coro safely. On any crash, mark the
+    batch's still-pending rows as error so the queue never hangs in limbo and
+    the failure is visible (asyncio.create_task otherwise swallows exceptions).
+    """
+    try:
+        await coro
+    except Exception as e:
+        print(f"[bg] batch {batch_id} crashed: {e}")
+        try:
+            for it in db.queue_pending(batch_id):
+                db.queue_update(it["id"], "error", error=f"processing crashed: {e}")
+        except Exception as _ce:
+            print(f"[bg] cleanup failed for {batch_id}: {_ce}")
+
+
 # ─── PDF SPLIT (background) — rasterize PDF pages + extract embedded images ───
 
 async def _split_pdfs_then_process(
@@ -667,17 +696,17 @@ async def _split_pdfs_then_process(
     import fitz
     from PIL import Image as PILImage
 
-    for job in pdf_jobs:
+    def _split_one(job):
         dest = job.get("dest")
         safe_name = job.get("safe_name")
         if not dest or not os.path.isfile(dest):
-            continue
+            return
         base_name = os.path.splitext(safe_name)[0]
         try:
             doc = fitz.open(dest)
         except Exception as e:
             print(f"[pdf-bg] open failed for {safe_name}: {e}")
-            continue
+            return
         try:
             for i, page in enumerate(doc, start=1):
                 try:
@@ -732,6 +761,14 @@ async def _split_pdfs_then_process(
             except Exception as _de:
                 print(f"[pdf-bg] failed to remove placeholder {pid}: {_de}")
 
+    # Rasterization (fitz + PIL) is CPU-bound — run each PDF off the event
+    # loop so login/other requests stay responsive during a big PDF.
+    for job in pdf_jobs:
+        try:
+            await asyncio.to_thread(_split_one, job)
+        except Exception as _se:
+            print(f"[pdf-bg] split failed for {job.get('safe_name')}: {_se}")
+
     # Now run the normal LLM processing on everything that was queued
     await _process_batch(batch_id, owner_uuid, client_meta)
 
@@ -750,7 +787,9 @@ async def _process_batch(batch_id: str = None, owner_uuid: str = None, client_me
     queue_map = {}
     for item in pending:
         try:
-            img = load_image(item["file_path"])
+            # PIL decode + QR scan + base64 are CPU-bound; keep them off the
+            # single event loop so login/other requests aren't blocked.
+            img = await asyncio.to_thread(load_image, item["file_path"])
             images.append(img)
             queue_map[img["file"]] = item
         except Exception as e:
@@ -763,6 +802,12 @@ async def _process_batch(batch_id: str = None, owner_uuid: str = None, client_me
         print(f"  [{done}/{total}] {name}")
 
     results = await extract_batch(images, on_progress=on_progress)
+
+    # Drop the base64 image payloads now that the LLM calls are done — the
+    # persist loop below doesn't need them. Keeps RAM bounded on big batches.
+    for _im in images:
+        if isinstance(_im, dict):
+            _im.pop("image_b64", None)
 
     cm = client_meta or {}
     done_count = 0
@@ -919,62 +964,70 @@ async def _process_batch(batch_id: str = None, owner_uuid: str = None, client_me
             import json as _json_ds
             mx["device_signals"] = _json_ds.dumps(cm.get("device_signals") or {})
 
-            # Image quality + dedup
-            if src_path and os.path.isfile(src_path):
-                ph = compute_phash(src_path)
-                if ph:
-                    mx["image_phash"] = ph
-                    conn = db._conn()
-                    try:
-                        dup = find_near_dup(conn, ph)
-                    finally:
-                        conn.close()
-                    if dup:
-                        mx["near_dup_of"] = dup
-                bs = compute_blur(src_path)
-                if bs is not None:
-                    mx["blur_score"] = bs
-                    mx["is_blurry"] = _is_blurry(bs)
+            # ── Heavy CPU + DB work runs in a worker thread ──────────
+            # phash/blur (CPU), insert_extraction + vs.index_record (DB +
+            # embedding HTTP), and tagging (DB) all block; on the single
+            # event loop they freeze login/other requests for the whole
+            # batch. Run them off the loop via asyncio.to_thread.
+            def _persist(r=r, item=item, folder=folder, doc_owner=doc_owner,
+                         src_path=src_path, mx=mx, fname=fname):
+                # Image quality + dedup
+                if src_path and os.path.isfile(src_path):
+                    ph = compute_phash(src_path)
+                    if ph:
+                        mx["image_phash"] = ph
+                        conn = db._conn()
+                        try:
+                            dup = find_near_dup(conn, ph)
+                        finally:
+                            conn.close()
+                        if dup:
+                            mx["near_dup_of"] = dup
+                    bs = compute_blur(src_path)
+                    if bs is not None:
+                        mx["blur_score"] = bs
+                        mx["is_blurry"] = _is_blurry(bs)
 
-            # ── Source channel inference ───────────────────────────
-            folder_lc = (folder or "").lower()
-            if folder_lc.startswith("wechat_") or folder_lc.startswith("wechat-"):
-                _src_ch = "wechat"
-            elif folder_lc.startswith("email_") or folder_lc.startswith("email-"):
-                _src_ch = "email"
-            elif (r.get("metadata") or {}).get("source") == "url_ingest" or folder_lc.startswith("url_"):
-                _src_ch = "url"
-            else:
-                _src_ch = "upload"
-            mx["source_channel"] = _src_ch
+                # ── Source channel inference ───────────────────────────
+                folder_lc = (folder or "").lower()
+                if folder_lc.startswith("wechat_") or folder_lc.startswith("wechat-"):
+                    _src_ch = "wechat"
+                elif folder_lc.startswith("email_") or folder_lc.startswith("email-"):
+                    _src_ch = "email"
+                elif (r.get("metadata") or {}).get("source") == "url_ingest" or folder_lc.startswith("url_"):
+                    _src_ch = "url"
+                else:
+                    _src_ch = "upload"
+                mx["source_channel"] = _src_ch
 
-            # Trade-show passthrough from queue row
-            if item.get("trade_show"):
-                mx["trade_show"] = item["trade_show"]
+                # Trade-show passthrough from queue row
+                if item.get("trade_show"):
+                    mx["trade_show"] = item["trade_show"]
 
-            db.insert_extraction(folder, r, owner_uuid=doc_owner, is_shared=0, metadata_extra=mx)
-            vs.index_record(folder, r)
+                db.insert_extraction(folder, r, owner_uuid=doc_owner, is_shared=0, metadata_extra=mx)
+                vs.index_record(folder, r)
 
-            # AI auto-tagging — best-effort, heuristic (no extra LLM call)
-            try:
-                from pipeline.tagger import suggest_tags
-                tags = suggest_tags({**r, "metadata": {**mx, **(r.get("metadata") or {})}})
-                if tags:
-                    with db.db() as _c:
-                        # Get doc uuid we just inserted
-                        row = _c.execute(
-                            "SELECT uuid FROM documents WHERE folder = ? AND source_file = ?",
-                            (folder, r.get("source_file", "")),
-                        ).fetchone()
-                        if row:
-                            doc_uuid = row["uuid"]
-                            for tname in tags:
-                                tag_uuid = db.create_tag(_c, tname, user_uuid=doc_owner)
-                                db.tag_document(_c, doc_uuid, tag_uuid, user_uuid=doc_owner)
-            except Exception as _e:
-                print(f"[tagger] error for {fname}: {_e}")
+                # AI auto-tagging — best-effort, heuristic (no extra LLM call)
+                try:
+                    from pipeline.tagger import suggest_tags
+                    tags = suggest_tags({**r, "metadata": {**mx, **(r.get("metadata") or {})}})
+                    if tags:
+                        with db.db() as _c:
+                            # Get doc uuid we just inserted
+                            row = _c.execute(
+                                "SELECT uuid FROM documents WHERE folder = ? AND source_file = ?",
+                                (folder, r.get("source_file", "")),
+                            ).fetchone()
+                            if row:
+                                doc_uuid = row["uuid"]
+                                for tname in tags:
+                                    tag_uuid = db.create_tag(_c, tname, user_uuid=doc_owner)
+                                    db.tag_document(_c, doc_uuid, tag_uuid, user_uuid=doc_owner)
+                except Exception as _e:
+                    print(f"[tagger] error for {fname}: {_e}")
+                return 1
 
-            done_count += 1
+            done_count += await asyncio.to_thread(_persist)
 
     # Save JSON
     bid = batch_id or "batch"
@@ -2356,6 +2409,67 @@ def _start_vector_pruner():
     _apply_cron_config(sched)
     sched.start()
     print(f"[sched] cron started in this worker. jobs: {list(_JOB_REGISTRY.keys())}")
+
+
+@app.on_event("startup")
+def _auto_reindex_vectors():
+    """Self-heal the vector store. If it's empty but extractions exist on disk
+    (e.g. first boot after switching to a Chroma server with a fresh volume),
+    rebuild the index ONCE — in a single worker (exclusive file lock), in a
+    background thread so startup + /health are not blocked. Only runs when the
+    store is empty, so it's a no-op on normal restarts (no extra embed cost)."""
+    import threading
+    import fcntl as _fcntl
+
+    def _run():
+        try:
+            import vectorstore as vs
+            try:
+                if vs.collection.count() > 0:
+                    return  # already populated — nothing to do
+            except Exception as e:
+                print(f"[reindex] count check failed (chroma not ready?): {e}")
+                return
+
+            ext_dir = config.EXTRACTIONS_DIR
+            has_json = (
+                os.path.isdir(ext_dir)
+                and any(
+                    f.endswith(".json") and f != "all_extractions.json"
+                    for f in os.listdir(ext_dir)
+                )
+            )
+            if not has_json:
+                print("[reindex] vectors empty + no extractions on disk — skipping")
+                return
+
+            # Only one worker rebuilds (others skip on lock contention)
+            lock_path = os.path.join(config.DATA_DIR, ".reindex.lock")
+            try:
+                fh = open(lock_path, "w")
+                _fcntl.flock(fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                globals()["_REINDEX_LOCK_FH"] = fh  # keep ref so lock holds
+            except (OSError, BlockingIOError):
+                print("[reindex] another worker is reindexing — skipping here")
+                return
+
+            # Re-check after lock — a peer may have finished between checks
+            try:
+                if vs.collection.count() > 0:
+                    return
+            except Exception:
+                pass
+
+            print("[reindex] vectors empty — rebuilding from extractions JSON...")
+            try:
+                n = vs.index_all_from_json()
+                print(f"[reindex] done — indexed {n} records")
+            except Exception as e:
+                print(f"[reindex] rebuild failed: {e}")
+        except Exception as e:
+            print(f"[reindex] startup error: {e}")
+
+    threading.Thread(target=_run, name="auto-reindex", daemon=True).start()
 
 
 def _apply_cron_config(sched=None):

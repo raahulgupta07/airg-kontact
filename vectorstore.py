@@ -38,7 +38,30 @@ class OpenRouterEmbeddingFunction(EmbeddingFunction):
         return self._call_api(texts)
 
 
-_client = chromadb.PersistentClient(path=CHROMA_DIR)
+def _make_client():
+    """HttpClient (shared Chroma server) when CHROMA_HOST is set — required to
+    run multiple uvicorn workers, since PersistentClient is single-process and
+    deadlocks across workers. Falls back to embedded PersistentClient otherwise
+    (single-worker dev/default). Retries so kontact can start before Chroma is
+    fully up."""
+    host = os.getenv("CHROMA_HOST")
+    if not host:
+        return chromadb.PersistentClient(path=CHROMA_DIR)
+    port = int(os.getenv("CHROMA_PORT", "8000"))
+    last = None
+    for _ in range(30):  # up to ~60s
+        try:
+            c = chromadb.HttpClient(host=host, port=port)
+            c.heartbeat()
+            print(f"[chroma] connected to server {host}:{port}")
+            return c
+        except Exception as e:
+            last = e
+            time.sleep(2)
+    raise RuntimeError(f"ChromaDB server {host}:{port} unreachable after retries: {last}")
+
+
+_client = _make_client()
 _embed_fn = OpenRouterEmbeddingFunction()
 collection = _client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=_embed_fn)
 
