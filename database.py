@@ -14,6 +14,33 @@ _pool: "queue.Queue[sqlite3.Connection]" = queue.Queue(maxsize=_POOL_SIZE)
 _pool_lock = threading.Lock()
 _pool_created = 0
 
+# Global WRITE serialization. SQLite allows only one writer; under a threadpool
+# (many concurrent request threads) two writers collide → "database is locked"
+# even with busy_timeout. Acquire this lock around every write transaction so
+# writes queue cleanly in-process. Reads (WAL) stay fully concurrent.
+_WRITE_LOCK = threading.RLock()
+
+
+@contextmanager
+def write_lock():
+    """Serialize a write transaction. Use: `with db.write_lock(): ...writes...`."""
+    _WRITE_LOCK.acquire()
+    try:
+        yield
+    finally:
+        _WRITE_LOCK.release()
+
+
+def serialized_write(fn):
+    """Decorator: run a write-heavy function holding the global write lock."""
+    import functools
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with _WRITE_LOCK:
+            return fn(*args, **kwargs)
+    return _wrapped
+
 
 class _PooledConn(sqlite3.Connection):
     """sqlite3.Connection subclass — .close() returns to pool."""
@@ -39,7 +66,7 @@ def _build_conn() -> sqlite3.Connection:
     )
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA busy_timeout=30000")
+    c.execute("PRAGMA busy_timeout=60000")
     c.execute("PRAGMA foreign_keys=ON")
     c.execute("PRAGMA synchronous=NORMAL")        # WAL-safe; faster than FULL
     c.execute("PRAGMA temp_store=MEMORY")
@@ -295,6 +322,8 @@ def _migrate_columns(c):
 
     _add_column(c, "queue", "updated_at TEXT")
     _add_column(c, "queue", "source_channel TEXT DEFAULT 'upload'")
+    _add_column(c, "queue", "source_sender TEXT")
+    _add_column(c, "queue", "file_hash TEXT")
 
     # chat_history: scope to user
     _add_column(c, "chat_history", "user_uuid TEXT")
@@ -1489,6 +1518,7 @@ def touch_login(c, user_uuid: str):
     c.commit()
 
 
+@serialized_write
 def insert_extraction(folder: str, record: dict, owner_uuid: str = None, is_shared: int = 0,
                       metadata_extra: dict = None):
     c = _conn()
@@ -1756,13 +1786,16 @@ def get_stats() -> dict:
 
 
 def save_chat(session_id: str, role: str, content: str, user_uuid: str = None):
-    c = _conn()
-    c.execute(
-        "INSERT INTO chat_history (session_id, role, content, user_uuid) VALUES (?, ?, ?, ?)",
-        (session_id, role, content, user_uuid),
-    )
-    c.commit()
-    c.close()
+    with write_lock():
+        c = _conn()
+        try:
+            c.execute(
+                "INSERT INTO chat_history (session_id, role, content, user_uuid) VALUES (?, ?, ?, ?)",
+                (session_id, role, content, user_uuid),
+            )
+            c.commit()
+        finally:
+            c.close()
 
 
 def get_chat_history(session_id: str, limit: int = 50, user: dict = None) -> list:
@@ -1821,22 +1854,18 @@ def delete_session(session_id: str):
 def queue_add(batch_id: str, file_name: str, file_path: str,
               source_channel: str = None, source_sender: str = None, file_hash: str = None,
               owner_uuid: str = None, trade_show: str = None):
-    c = _conn()
-    for col_def in ["source_channel TEXT", "source_sender TEXT", "file_hash TEXT",
-                    "owner_uuid TEXT", "trade_show TEXT"]:
+    with write_lock():
+        c = _conn()
         try:
-            c.execute(f"ALTER TABLE queue ADD COLUMN {col_def}")
+            c.execute(
+                "INSERT INTO queue (batch_id, file_name, file_path, source_channel, source_sender, "
+                "file_hash, owner_uuid, trade_show) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (batch_id, file_name, file_path, source_channel, source_sender,
+                 file_hash, owner_uuid, trade_show),
+            )
             c.commit()
-        except sqlite3.OperationalError:
-            pass
-    c.execute(
-        "INSERT INTO queue (batch_id, file_name, file_path, source_channel, source_sender, "
-        "file_hash, owner_uuid, trade_show) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (batch_id, file_name, file_path, source_channel, source_sender,
-         file_hash, owner_uuid, trade_show),
-    )
-    c.commit()
-    c.close()
+        finally:
+            c.close()
 
 
 def file_already_ingested(file_hash: str) -> bool:
@@ -2024,6 +2053,7 @@ def queue_pending(batch_id: str = None) -> list:
     return [dict(r) for r in rows]
 
 
+@serialized_write
 def queue_delete_by_id(queue_id: int) -> int:
     c = _conn()
     try:
@@ -2034,12 +2064,15 @@ def queue_delete_by_id(queue_id: int) -> int:
     return n
 
 
+@serialized_write
 def queue_update(queue_id: int, status: str, image_type: str = None, error: str = None):
     c = _conn()
-    c.execute("UPDATE queue SET status = ?, image_type = ?, error = ?, processed_at = CURRENT_TIMESTAMP WHERE id = ?",
-              (status, image_type, error, queue_id))
-    c.commit()
-    c.close()
+    try:
+        c.execute("UPDATE queue SET status = ?, image_type = ?, error = ?, processed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                  (status, image_type, error, queue_id))
+        c.commit()
+    finally:
+        c.close()
 
 
 def queue_errors(batch_id: str = None) -> list:
@@ -2076,12 +2109,25 @@ def queue_status(batch_id: str = None) -> dict:
 
 
 def delete_batch(batch_id: str) -> int:
-    c = _conn()
-    queue_deleted = c.execute("DELETE FROM queue WHERE batch_id = ?", (batch_id,)).rowcount
-    doc_deleted = c.execute("DELETE FROM documents WHERE folder = ?", (batch_id,)).rowcount
-    c.commit()
-    c.close()
-    return queue_deleted + doc_deleted
+    with write_lock():
+        c = _conn()
+        try:
+            # Remove FK children first to avoid FOREIGN KEY constraint failures
+            c.execute("DELETE FROM products WHERE folder = ?", (batch_id,))
+            c.execute("DELETE FROM contacts WHERE folder = ?", (batch_id,))
+            try:
+                c.execute(
+                    "DELETE FROM document_tags WHERE document_uuid IN "
+                    "(SELECT uuid FROM documents WHERE folder = ?)", (batch_id,)
+                )
+            except Exception:
+                pass
+            queue_deleted = c.execute("DELETE FROM queue WHERE batch_id = ?", (batch_id,)).rowcount
+            doc_deleted = c.execute("DELETE FROM documents WHERE folder = ?", (batch_id,)).rowcount
+            c.commit()
+            return queue_deleted + doc_deleted
+        finally:
+            c.close()
 
 
 def get_document(doc_uuid: str) -> dict | None:
@@ -2093,6 +2139,7 @@ def get_document(doc_uuid: str) -> dict | None:
         c.close()
 
 
+@serialized_write
 def delete_document(doc_uuid: str) -> dict:
     """Delete one document + its products/contacts/tags. Returns {folder, source_file, deleted}."""
     c = _conn()
@@ -2459,6 +2506,7 @@ def _merge_messengers(existing_json: str, new_list) -> str:
     return json.dumps(merged, ensure_ascii=False)
 
 
+@serialized_write
 def upsert_contact(c_data: dict, document_uuid: str = None, document_id: int = None,
                    owner_uuid: str = None, is_shared: int = 0,
                    source_channel: str = "upload") -> str:

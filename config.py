@@ -13,3 +13,7 @@ PORT = int(os.getenv("PORT", "8000"))
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
 EXTRACTIONS_DIR = os.path.join(DATA_DIR, "extractions")
+
+# Ensure runtime dirs exist (fresh cloud volumes may be empty → FileNotFoundError)
+for _d in (DATA_DIR, UPLOADS_DIR, EXTRACTIONS_DIR, os.path.join(DATA_DIR, "chroma")):
+    os.makedirs(_d, exist_ok=True)

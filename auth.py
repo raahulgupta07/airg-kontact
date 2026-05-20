@@ -109,12 +109,13 @@ def verify_token(token: str) -> Optional[dict]:
 # ─── login throttling ────────────────────────────────────────────────
 def record_login_attempt(identifier: str, ip: str, success: bool | int) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    with _db.db() as c:
-        c.execute(
-            "INSERT INTO login_attempts(identifier, ip, success, at) VALUES (?,?,?,?)",
-            (identifier or "", ip or "", 1 if success else 0, now),
-        )
-        c.commit()
+    with _db.write_lock():
+        with _db.db() as c:
+            c.execute(
+                "INSERT INTO login_attempts(identifier, ip, success, at) VALUES (?,?,?,?)",
+                (identifier or "", ip or "", 1 if success else 0, now),
+            )
+            c.commit()
 
 
 def is_locked(identifier: str) -> bool:

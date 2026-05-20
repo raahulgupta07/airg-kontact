@@ -77,6 +77,11 @@ def _product_company(document_uuid: str) -> str:
 
 
 def _apply_update(contact_uuid: str, company: str, method: str, owner_uuid: Optional[str]):
+    with db.write_lock():
+        _apply_update_locked(contact_uuid, company, method, owner_uuid)
+
+
+def _apply_update_locked(contact_uuid: str, company: str, method: str, owner_uuid: Optional[str]):
     c = db._conn()
     try:
         c.execute(
