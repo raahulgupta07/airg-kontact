@@ -6,7 +6,50 @@ Internal reference for working on KONTACT. Read this before making changes.
 
 **Multi-tenant catalog vision RAG agent** — trade-show team uploads catalog photos + business-card QRs, extractors structure the data, agent answers SQL-aware questions about who-met-where.
 
-**Status**: Production-shape. 48 fixes/features landed across this session — see "Hardening landmarks" below.
+**Status**: Production-shape. See "Hardening landmarks" + "Session 2 additions" below.
+
+## Session 2 additions (data quality, dedup, admin, guardrails, PWA)
+
+### Data quality
+- **Company cascade resolver** (`pipeline/company_resolver.py`): contact.company → doc.company → products[0].company → website-domain → email-domain (generic-provider blocklist). Used at insert (`database.insert_extraction`) + backfill.
+- **Backfill jobs** (`pipeline/backfill.py`): `backfill_company()` cheap cascade, `backfill_company_llm()` LLM re-vision (cap 50). Skips `edit_count > 0`. Logs to `events`.
+- **Quality score** (`pipeline/extractor.py:_quality_score`): 0-1 confidence × completeness. `documents.quality_score` + `needs_revision` columns. <0.5 flagged.
+- **agents.py**: `qr_card` + `contact_page` prompts now include `company` inside `contact` object.
+
+### Dedup + approval
+- Tables: `merge_proposals` (keep/drop/reason/confidence/status/before_snapshot/after_snapshot), `merge_blacklist`.
+- Scanner (`pipeline/dedup.py`): contacts (phone_e164/email/company+person), documents (file_hash/phash≤4/filename/phash 5-8).
+- Engine: reuse `merge_contacts()`; NEW `merge_documents()` (atomic FK reassign products/contacts/tags/notes → keep, delete drop).
+- Endpoints: `/api/merge/{scan,proposals,proposals/{id}/approve|reject|swap,proposals/bulk-approve,clusters,clusters/approve,clusters/reject}`.
+- UI: `MergeClusters.svelte` — groups duplicates by (keep_uuid, reason), one card per cluster, image thumbs + rich data (products/contact/quality/text snippet), single "merge all" + per-cluster insights.
+
+### Admin (Settings → Admin Insights, super_admin)
+- `llm_usage` table + `log_llm_usage()` (wired in extractor + chat). `LLM_PRICING_USD_PER_M` rates.
+- Dashboards: `llm_cost_summary()`, `usage_heatmap()`, `conversion_funnel()`, `trade_show_summary()`.
+- **Editable cron** (`cron_config` table): `_apply_cron_config()` rebuilds APScheduler live. Endpoints `GET/PATCH /api/admin/jobs/schedule/{id}`.
+- **On-demand jobs**: `_JOB_REGISTRY` + `POST /api/admin/jobs/run/{id}` (super_admin). Jobs: vs_prune, backfill_cheap, backfill_llm, dedup_scan, ts_summary.
+- Audit Log viewer (`AuditLog.svelte`), `/api/me/stats`.
+
+### Infra
+- **SQLite connection pool** (`database.py`): `_PooledConn` subclass, 16 conns (`DB_POOL_SIZE`), WAL + `synchronous=NORMAL` + 20MB cache. Tested 25 concurrent. For ~20 users.
+- **Thumbnail endpoint** `/api/thumb/{folder}/{file}?w=256`: PIL resize → disk cache `<folder>/.thumbs/`, 7-day Cache-Control. Grid views use thumbs; lightbox uses full `/api/image`.
+- **Filename guard**: upload skips same `(owner, filename)` within 24h unless `force=1`.
+
+### Chat guardrails (`chat.py`)
+- Hard pre-filter `_is_injection_attempt()`: regex blocks jailbreak/injection before LLM (ignore-instructions, reveal-prompt, role-change, DAN). `REFUSAL_MESSAGE`.
+- System prompt SCOPE section: catalog-data-only, refuse general knowledge/coding/opinions/news/roleplay.
+- Applied to `/api/chat` (`ask()`) + `/api/chat/stream`.
+- NEW tool `semantic_search_images(query, limit)` (tools.py) → ChromaDB hits w/ `[IMAGE: folder/file]` citations.
+
+### UI restructure
+- **Settings** nav (was "More", admin-only) consolidates tabs: Tools / Stats / Users / Admin Insights. Standalone Users nav removed; `UsersManager.svelte` extracted from `/users` route (route still works).
+- Regular users see only: Upload / Queue / Agent / Data. Admins also: Sync / Settings.
+- Keyboard shortcuts (`/` search, `n` upload, `g`+{d,q,c,u}, `?` help), undo toasts (`undoToast.svelte.ts` + `UndoStack.svelte`), `Skeleton.svelte`, `EmptyState.svelte`, `PullRefresh.svelte`, nav upload badges.
+
+### PWA
+- Full icon set (`static/icons/`, 72-512 + maskable + apple-touch + 4 iOS splash). Enriched `manifest.json` (shortcuts, maskable, display_override).
+- iOS Safari install-hint banner (no `beforeinstallprompt` on iOS). `app.html` apple meta + splash + theme-color light/dark.
+- `sw.js` v3: shell precache, thumb/image cache-first, API network-only w/ offline JSON.
 
 **Architecture**:
 ```

@@ -2,7 +2,19 @@
 
 **Catalog vision RAG agent for trade shows.** Snap photos, scan QRs, extract structured data with multi-agent AI, and chat with an SQL-aware agent that remembers who you met.
 
-Multi-tenant. Hardened. Production-shape. One-tap mobile.
+Multi-tenant. Hardened. Production-shape. One-tap mobile. Installable PWA (Android + iOS).
+
+---
+
+## What's new
+
+- **Company auto-fill** — cascade resolver (contact → doc → product → website → email domain) + nightly/on-demand backfill jobs
+- **Duplicate cleanup** — cluster view groups duplicates, one-click "merge all into master", human-approved (no silent deletes), 7-tier scanner (file hash / perceptual hash / filename / phone / email / company+person)
+- **Admin Insights** (Settings → Admin) — LLM cost dashboard, usage heatmap, conversion funnel, run nightly jobs on-demand, **edit cron schedule live** (no restart)
+- **Chat guardrails** — agent answers only catalog data; refuses general knowledge + blocks prompt-injection
+- **Faster images** — thumbnail endpoint with disk cache; SQLite connection pool for ~20 concurrent users
+- **PWA polish** — full icon set, iOS install hint, splash screens, offline service worker
+- **Quality score** per extraction; **filename re-upload guard**; **audit log viewer**
 
 ---
 
