@@ -20,4 +20,4 @@ COPY --from=frontend /build/build /app/frontend/build
 ENV PORT=8000
 EXPOSE ${PORT}
 HEALTHCHECK --interval=30s --timeout=5s CMD curl -f http://localhost:${PORT}/health || exit 1
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT}
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers ${UVICORN_WORKERS:-4}

@@ -370,15 +370,41 @@
     reloadTables();
   });
 
+  let cardSearch = $state('');
+
+  function _docMatchesSearch(d, q) {
+    if (!q) return true;
+    const hay = [
+      d.company, d.title, d.source_file, d.folder, d.image_type, d.trade_show,
+      d.raw_text, d.country, d.city,
+    ];
+    // products + contact JSON
+    let prods = d.products;
+    if (typeof prods === 'string') { try { prods = JSON.parse(prods); } catch { prods = []; } }
+    if (Array.isArray(prods)) for (const p of prods) hay.push(p?.name, p?.product_name, p?.model, p?.category, p?.price);
+    let c = d.contact;
+    if (typeof c === 'string') { try { c = JSON.parse(c); } catch { c = {}; } }
+    if (c) hay.push(c.person, c.phone, c.email, c.website, c.company);
+    return hay.some(v => v && String(v).toLowerCase().includes(q));
+  }
+
   function applyFilters() {
+    const q = cardSearch.trim().toLowerCase();
     let result = docs.filter(d => {
       if (folderFilter !== 'All' && d.folder !== folderFilter) return false;
       if (typeFilter !== 'All' && d.image_type !== typeFilter) return false;
+      if (q && !_docMatchesSearch(d, q)) return false;
       return true;
     });
     filtered = applySorting(result);
   }
 
+  let _searchDebounce;
+  function onCardSearch(e) {
+    cardSearch = e.target.value;
+    clearTimeout(_searchDebounce);
+    _searchDebounce = setTimeout(applyFilters, 180);
+  }
   function onFolderChange(e) { folderFilter = e.target.value; applyFilters(); }
   function onTypeChange(e) { typeFilter = e.target.value; applyFilters(); }
   function onSortChange(e) { sortOption = e.target.value; applyFilters(); }
@@ -490,6 +516,16 @@
 
   {#if activeTab === 'cards'}
     <div class="filter-bar">
+      <div class="filter-group grow">
+        <label>Search</label>
+        <input
+          type="search"
+          class="input"
+          placeholder="Search company, person, product, file, text…"
+          value={cardSearch}
+          oninput={onCardSearch}
+        />
+      </div>
       <div class="filter-group">
         <label>Folder</label>
         <select class="input" onchange={onFolderChange} value={folderFilter}>
@@ -505,6 +541,9 @@
         </select>
       </div>
     </div>
+    {#if cardSearch.trim()}
+      <p class="search-count">{filtered.length} match{filtered.length === 1 ? '' : 'es'} for "{cardSearch.trim()}"</p>
+    {/if}
 
     {#if loading}
       <div class="loading">Loading documents...</div>
@@ -974,9 +1013,11 @@
   .filter-group {
     flex: 1; display: flex; flex-direction: column; gap: 4px;
   }
+  .filter-group.grow { flex: 2; }
   .filter-group label {
     font-size: 12px; color: var(--text-muted); font-weight: 500;
   }
+  .search-count { font-size: 12px; color: var(--text-muted); margin: -8px 0 12px; }
 
   .loading {
     text-align: center;

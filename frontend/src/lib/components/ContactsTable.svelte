@@ -16,21 +16,29 @@
     catch (e) { showToast('Bulk vCard failed: ' + e.message); }
   }
 
+  function _createdTs(c) {
+    const d = new Date(c.created_at || 0).getTime();
+    return isNaN(d) ? 0 : d;
+  }
+
   let filteredContacts = $derived.by(() => {
-    if (!contactSearch.trim()) return contacts;
-    const q = contactSearch.toLowerCase();
-    return contacts.filter(c =>
-      (c.company || '').toLowerCase().includes(q) ||
-      (c.person || c.name || '').toLowerCase().includes(q) ||
-      (c.phone || c.phone_e164 || '').toLowerCase().includes(q) ||
-      (c.email || '').toLowerCase().includes(q) ||
-      (c.website || '').toLowerCase().includes(q) ||
-      (c.address || '').toLowerCase().includes(q) ||
-      (c.owner_name || '').toLowerCase().includes(q) ||
-      (c.source_channel || '').toLowerCase().includes(q) ||
-      (c.backfill_source || '').toLowerCase().includes(q) ||
-      (c.uuid || '').toLowerCase().includes(q)
-    );
+    let list = contacts;
+    const q = contactSearch.trim().toLowerCase();
+    if (q) {
+      list = contacts.filter(c =>
+        (c.company || '').toLowerCase().includes(q) ||
+        (c.person || c.name || '').toLowerCase().includes(q) ||
+        (c.phone || c.phone_e164 || '').toLowerCase().includes(q) ||
+        (c.email || '').toLowerCase().includes(q) ||
+        (c.website || '').toLowerCase().includes(q) ||
+        (c.address || '').toLowerCase().includes(q) ||
+        (c.owner_name || '').toLowerCase().includes(q) ||
+        (c.source_channel || '').toLowerCase().includes(q) ||
+        (c.backfill_source || '').toLowerCase().includes(q)
+      );
+    }
+    // Newest created first
+    return [...list].sort((a, b) => _createdTs(b) - _createdTs(a));
   });
 </script>
 
@@ -48,12 +56,11 @@
     <div class="table-scroll">
       <table class="data-table">
         <thead>
-          <tr><th>UUID</th><th>Company</th><th>Person</th><th>Phone</th><th>Email</th><th>Website</th><th>Created</th><th>Updated</th><th>Owner</th><th>Source</th><th></th></tr>
+          <tr><th>Company</th><th>Person</th><th>Phone</th><th>Email</th><th>Website</th><th>Created</th><th>Updated</th><th>Owner</th><th>Source</th><th></th></tr>
         </thead>
         <tbody>
           {#each filteredContacts as c}
             <tr>
-              <td class="uuid-cell">{(c.uuid || '').slice(0, 8)}</td>
               <td>
                 {c.company || ''}
                 {#if c.backfill_source && c.company}

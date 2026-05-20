@@ -345,15 +345,16 @@ async def ask(question: str, session_id: str = None, history: list = None, user:
     if _is_injection_attempt(question):
         if session_id:
             uid = (user or {}).get("uuid") if user else None
-            db.save_chat(session_id, "user", question, user_uuid=uid)
-            db.save_chat(session_id, "assistant", REFUSAL_MESSAGE, user_uuid=uid)
+            await asyncio.to_thread(db.save_chat, session_id, "user", question, uid)
+            await asyncio.to_thread(db.save_chat, session_id, "assistant", REFUSAL_MESSAGE, uid)
         return {"answer": REFUSAL_MESSAGE, "sources": [], "session_id": session_id, "refused": True}
 
-    context = _build_context(question)
+    # Blocking ChromaDB embed + FTS5 → run off the event loop
+    context = await asyncio.to_thread(_build_context, question)
     system_prompt = _build_system_prompt(user=user)
 
     if session_id and not history:
-        history = db.get_chat_history(session_id, limit=6, user=user)
+        history = await asyncio.to_thread(db.get_chat_history, session_id, 6, user)
 
     messages = [{"role": "system", "content": system_prompt}]
     if history:
@@ -370,13 +371,13 @@ async def ask(question: str, session_id: str = None, history: list = None, user:
         response = await _run_tool_loop(messages, response, user=user)
 
     sources = []
-    for s in vs.query(question, n_results=3):
+    for s in await asyncio.to_thread(vs.query, question, 3):
         sources.append({"folder": s["metadata"]["folder"], "file": s["metadata"]["source_file"],
                         "company": s["metadata"].get("company", "")})
 
     if session_id:
         uid = (user or {}).get("uuid") if user else None
-        db.save_chat(session_id, "user", question, user_uuid=uid)
-        db.save_chat(session_id, "assistant", response, user_uuid=uid)
+        await asyncio.to_thread(db.save_chat, session_id, "user", question, uid)
+        await asyncio.to_thread(db.save_chat, session_id, "assistant", response, uid)
 
     return {"answer": response, "sources": sources, "session_id": session_id}

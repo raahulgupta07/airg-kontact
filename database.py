@@ -9,7 +9,7 @@ DB_PATH = os.path.join(config.DATA_DIR, "kontact.db")
 # ─── Connection pool (SQLite WAL — many readers + 1 writer) ──────────────
 # Tuned for 20 concurrent users. WAL allows concurrent reads; writes queue
 # via busy_timeout. Pool reuses connections to skip open/pragma overhead.
-_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "16"))
+_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "32"))
 _pool: "queue.Queue[sqlite3.Connection]" = queue.Queue(maxsize=_POOL_SIZE)
 _pool_lock = threading.Lock()
 _pool_created = 0

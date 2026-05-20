@@ -381,41 +381,17 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
         name = name.replace("\x00", "").replace("..", "_")
         return name[:200] or "upload"
 
-    force_reupload = (form.get("force") or "").strip().lower() in ("1", "true", "yes")
-
-    def _recent_same_filename(owner_uuid: str, fname: str) -> str | None:
-        """Return existing batch_id if same (owner, filename) ingested in last 24h."""
-        try:
-            c = db._conn()
-            try:
-                row = c.execute(
-                    "SELECT folder FROM documents "
-                    "WHERE owner_uuid = ? AND source_file = ? "
-                    "AND created_at >= datetime('now', '-1 day') "
-                    "ORDER BY id DESC LIMIT 1",
-                    (owner_uuid, fname),
-                ).fetchone()
-                return row["folder"] if row else None
-            finally:
-                c.close()
-        except Exception:
-            return None
-
+    # NOTE: no filename-based dedup guard here. Camera captures share generic
+    # names ("image.jpg") so a filename guard would silently reject every photo
+    # after the first. True duplicate detection is handled post-ingest by:
+    #   - file_hash exact-dup check (database.file_already_ingested)
+    #   - nightly dedup_scan → human-approved merge proposals
     queued = []
     skipped = []
     pdf_jobs: list = []
     for f in files:
         safe_name = _safe_filename(f.filename)
         ext = os.path.splitext(safe_name)[1].lower()
-        if not force_reupload:
-            dup_batch = _recent_same_filename(user["uuid"], safe_name)
-            if dup_batch:
-                skipped.append({
-                    "name": safe_name,
-                    "reason": f"duplicate filename in last 24h (batch {dup_batch}); pass force=1 to override",
-                    "existing_batch_id": dup_batch,
-                })
-                continue
         if ext not in SUPPORTED:
             print(f"[upload] skip {safe_name!r}: ext {ext!r} not in SUPPORTED")
             skipped.append({"name": safe_name, "reason": f"unsupported extension {ext}"})
@@ -1563,7 +1539,7 @@ def _safe_under(base_dir: str, candidate: str) -> bool:
 
 
 @app.get("/api/thumb/{folder}/{filename:path}")
-async def serve_thumb(folder: str, filename: str, w: int = 256, user=Depends(current_user)):
+def serve_thumb(folder: str, filename: str, w: int = 256, user=Depends(current_user)):
     """Serve cached resized thumbnail (default 256px wide).
 
     Generates once into <UPLOADS_DIR>/<folder>/.thumbs/<w>_<filename>.jpg, then
@@ -1649,7 +1625,7 @@ async def serve_thumb(folder: str, filename: str, w: int = 256, user=Depends(cur
 
 
 @app.get("/api/image/{folder}/{filename:path}")
-async def serve_image(folder: str, filename: str, user=Depends(current_user)):
+def serve_image(folder: str, filename: str, user=Depends(current_user)):
     from fastapi.responses import FileResponse, RedirectResponse
     if '..' in folder or '..' in filename or folder.startswith('/') or filename.startswith('/'):
         raise HTTPException(400, "Invalid path")
@@ -1737,15 +1713,15 @@ async def chat_stream(req: ChatRequest, user=Depends(current_user)):
             yield f"event: done\ndata: {json.dumps({'sources': [], 'session_id': session_id})}\n\n"
             return
 
-        # Build context with learning memory
+        # Build context (ChromaDB embed + FTS5 are blocking → run off event loop)
         yield f"event: status\ndata: {json.dumps({'step': 'Searching knowledge base...'})}\n\n"
-        context = chat._build_context(req.question)
+        context = await asyncio.to_thread(chat._build_context, req.question)
         system_prompt = chat._build_system_prompt(user=user)
 
         yield f"event: status\ndata: {json.dumps({'step': 'Querying LLM...'})}\n\n"
 
-        # Get history
-        history = db.get_chat_history(session_id, limit=6, user=user) if session_id else []
+        # Get history (blocking SQLite → threadpool)
+        history = await asyncio.to_thread(db.get_chat_history, session_id, 6, user) if session_id else []
 
         messages = [{"role": "system", "content": system_prompt}]
         for h in history[-6:]:
@@ -1827,9 +1803,9 @@ async def chat_stream(req: ChatRequest, user=Depends(current_user)):
         # Now stream the clean final answer to the client
         yield f"event: content\ndata: {json.dumps({'text': full_answer})}\n\n"
 
-        # Get sources
+        # Get sources (ChromaDB query blocks → threadpool)
         sources = []
-        for s in vs.query(req.question, n_results=3):
+        for s in await asyncio.to_thread(vs.query, req.question, 3):
             src_file = s["metadata"]["source_file"]
             folder = s["metadata"]["folder"]
             sources.append({
@@ -1839,9 +1815,9 @@ async def chat_stream(req: ChatRequest, user=Depends(current_user)):
                 "image_url": f"/api/image/{folder}/{src_file}",
             })
 
-        # Save to history
-        db.save_chat(session_id, "user", req.question, user_uuid=user["uuid"])
-        db.save_chat(session_id, "assistant", full_answer, user_uuid=user["uuid"])
+        # Save to history (blocking SQLite → threadpool)
+        await asyncio.to_thread(db.save_chat, session_id, "user", req.question, user["uuid"])
+        await asyncio.to_thread(db.save_chat, session_id, "assistant", full_answer, user["uuid"])
 
         yield f"event: done\ndata: {json.dumps({'sources': sources, 'session_id': session_id})}\n\n"
 
@@ -1961,6 +1937,8 @@ def sync_wechat_chats_assign(chat_hash: str, req: WeChatChatAssign, user=Depends
 
 @app.delete("/api/sync/wechat/chats/{chat_hash}")
 def sync_wechat_chats_delete(chat_hash: str, user=Depends(current_user)):
+    if user.get("role") not in ("super_admin", "admin"):
+        raise HTTPException(403, "admin only")
     n = db.wechat_map_delete(chat_hash)
     if not n:
         raise HTTPException(404, "chat_hash not found")
@@ -2221,11 +2199,10 @@ def _auto_start_sync():
 
 @app.on_event("startup")
 def _start_vector_pruner():
-    """Daily prune of orphan ChromaDB vectors (folder no longer in documents)."""
-    try:
-        from apscheduler.schedulers.background import BackgroundScheduler
-    except Exception:
-        return
+    """Daily jobs. Registry is populated in EVERY worker (so on-demand
+    /api/admin/jobs/run works on any worker). The APScheduler itself starts in
+    ONLY ONE worker — guarded by an exclusive file lock — so cron jobs don't
+    fire N× under uvicorn --workers."""
 
     def _prune():
         try:
@@ -2313,18 +2290,34 @@ def _start_vector_pruner():
             print(f"[backfill] llm error: {e}")
             return {"error": str(e)}
 
-    # Make jobs reachable by /api/admin/jobs/run/<id>
+    # Make jobs reachable by /api/admin/jobs/run/<id> — in EVERY worker
     _JOB_REGISTRY["vs_prune"] = _prune
     _JOB_REGISTRY["backfill_cheap"] = _nightly_backfill_cheap
     _JOB_REGISTRY["backfill_llm"] = _nightly_backfill_llm
     _JOB_REGISTRY["dedup_scan"] = _nightly_dedup_scan
     _JOB_REGISTRY["ts_summary"] = _nightly_trade_show_summaries
 
+    # Start the cron scheduler in ONLY ONE worker (exclusive file lock)
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+    except Exception:
+        print("[sched] APScheduler unavailable — on-demand jobs still work")
+        return
+    import fcntl
+    try:
+        lock_path = os.path.join(config.DATA_DIR, ".scheduler.lock")
+        _lock_fh = open(lock_path, "w")
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        globals()["_SCHED_LOCK_FH"] = _lock_fh  # keep ref so lock survives
+    except (OSError, BlockingIOError):
+        print("[sched] another worker owns the scheduler — cron skipped here (on-demand still works)")
+        return
+
     sched = BackgroundScheduler()
     globals()["_SCHED"] = sched
     _apply_cron_config(sched)
     sched.start()
-    print(f"[sched] registered jobs: {list(_JOB_REGISTRY.keys())}")
+    print(f"[sched] cron started in this worker. jobs: {list(_JOB_REGISTRY.keys())}")
 
 
 def _apply_cron_config(sched=None):
@@ -2803,7 +2796,15 @@ def doc_tag_attach(doc_uuid: str, req: TagAttachReq, user=Depends(current_user))
 
 @app.delete("/api/documents/{doc_uuid}/tags/{tag_uuid}")
 def doc_tag_detach(doc_uuid: str, tag_uuid: str, user=Depends(current_user)):
+    # Only the document owner or an admin may detach tags
     with db.db() as c:
+        doc = c.execute(
+            "SELECT owner_uuid FROM documents WHERE uuid = ?", (doc_uuid,)
+        ).fetchone()
+        if not doc:
+            raise HTTPException(404, "document not found")
+        if not db.can_edit(dict(doc), user):
+            raise HTTPException(403, "not allowed — owner or admin only")
         n = db.untag_document(c, doc_uuid, tag_uuid)
     if not n:
         raise HTTPException(404, "tag attachment not found")
