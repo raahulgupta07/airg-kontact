@@ -1728,6 +1728,15 @@ async def chat_stream(req: ChatRequest, user=Depends(current_user)):
         # Send session info
         yield f"event: session\ndata: {json.dumps({'session_id': session_id})}\n\n"
 
+        # Hard guardrail: blatant injection/jailbreak → refuse instantly
+        if chat._is_injection_attempt(req.question):
+            yield f"event: content\ndata: {json.dumps({'text': chat.REFUSAL_MESSAGE})}\n\n"
+            uid = (user or {}).get("uuid") if user else None
+            db.save_chat(session_id, "user", req.question, user_uuid=uid)
+            db.save_chat(session_id, "assistant", chat.REFUSAL_MESSAGE, user_uuid=uid)
+            yield f"event: done\ndata: {json.dumps({'sources': [], 'session_id': session_id})}\n\n"
+            return
+
         # Build context with learning memory
         yield f"event: status\ndata: {json.dumps({'step': 'Searching knowledge base...'})}\n\n"
         context = chat._build_context(req.question)
