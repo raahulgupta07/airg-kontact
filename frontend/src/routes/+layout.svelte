@@ -6,20 +6,37 @@
   import { theme, initTheme, toggleTheme } from '$lib/theme';
   import { auth } from '$lib/auth.svelte';
   import UploadTray from '$lib/components/UploadTray.svelte';
+  import UndoStack from '$lib/components/UndoStack.svelte';
+  import { uploadQueue } from '$lib/uploadQueue.svelte';
+
+  function activeJobsForKey(key: string): number {
+    if (key === 'upload' || key === 'queue') {
+      return uploadQueue.jobs.filter(j =>
+        j.status === 'queued' || j.status === 'uploading' || j.status === 'compressing'
+      ).length;
+    }
+    return 0;
+  }
+  function needsForceCount(): number {
+    return uploadQueue.jobs.filter(j => j.status === 'needs_force').length;
+  }
 
   let { children } = $props();
 
   const currentPath = $derived($page.url.pathname);
   const isLoginRoute = $derived(currentPath === '/login');
 
-  const tabs = [
-    { path: '/upload', label: 'Upload', key: 'upload' },
-    { path: '/queue',  label: 'Queue',  key: 'queue'  },
-    { path: '/chat',   label: 'Agent',  key: 'chat'   },
-    { path: '/data',   label: 'Data',   key: 'data'   },
-    { path: '/sync',   label: 'Sync',   key: 'sync'   },
-    { path: '/more',   label: 'More',   key: 'more'   }
+  const ALL_TABS = [
+    { path: '/upload', label: 'Upload', key: 'upload', adminOnly: false },
+    { path: '/queue',  label: 'Queue',  key: 'queue',  adminOnly: false },
+    { path: '/chat',   label: 'Agent',  key: 'chat',   adminOnly: false },
+    { path: '/data',   label: 'Data',   key: 'data',   adminOnly: false },
+    { path: '/sync',   label: 'Sync',     key: 'sync',     adminOnly: true },
+    { path: '/more',   label: 'Settings', key: 'more',     adminOnly: true }
   ] as const;
+
+  // Hide admin-only nav items from regular users
+  let tabs = $derived(ALL_TABS.filter(t => !t.adminOnly || auth.isAdmin));
 
   function isActive(tabPath: string): boolean {
     if (tabPath === '/upload') return currentPath === '/' || currentPath.startsWith('/upload');
@@ -34,6 +51,33 @@
   let deferredInstall: any = $state(null);
   let showInstall = $state(false);
   const INSTALL_DISMISS_KEY = 'kontact-install-dismissed';
+
+  // What's-new banner (bump version to re-show)
+  const WHATS_NEW_VERSION = 'v2026-05-19';
+  const WHATS_NEW_KEY = 'kontact-whats-new-dismissed';
+  let showWhatsNew = $state(false);
+
+  function dismissWhatsNew() {
+    showWhatsNew = false;
+    try { localStorage.setItem(WHATS_NEW_KEY, WHATS_NEW_VERSION); } catch {}
+  }
+
+  // iOS Add-to-Home-Screen hint (Safari only — no beforeinstallprompt event)
+  const IOS_HINT_KEY = 'kontact-ios-hint-dismissed';
+  let showIosHint = $state(false);
+
+  function detectIosSafari(): boolean {
+    if (typeof navigator === 'undefined') return false;
+    const ua = navigator.userAgent;
+    const isIos = /iPad|iPhone|iPod/.test(ua) && !(window as any).MSStream;
+    const isSafari = /^((?!chrome|crios|fxios|edgios).)*safari/i.test(ua);
+    const inStandalone = (navigator as any).standalone || window.matchMedia('(display-mode: standalone)').matches;
+    return isIos && isSafari && !inStandalone;
+  }
+  function dismissIosHint() {
+    showIosHint = false;
+    try { localStorage.setItem(IOS_HINT_KEY, '1'); } catch {}
+  }
 
   onMount(async () => {
     initTheme();
@@ -50,6 +94,18 @@
         deferredInstall = e;
         if (!dismissed) showInstall = true;
       });
+    } catch {}
+
+    // What's-new banner
+    try {
+      const seen = localStorage.getItem(WHATS_NEW_KEY);
+      if (seen !== WHATS_NEW_VERSION) showWhatsNew = true;
+    } catch {}
+
+    // iOS install hint
+    try {
+      const dismissed = localStorage.getItem(IOS_HINT_KEY);
+      if (!dismissed && detectIosSafari()) showIosHint = true;
     } catch {}
   });
 
@@ -80,7 +136,37 @@
   async function onSignOut() {
     await auth.logout();
   }
+
+  // Global keyboard shortcuts
+  function onGlobalKey(e: KeyboardEvent) {
+    // Skip if typing in input/textarea/contenteditable
+    const t = e.target as HTMLElement | null;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === '/') {
+      const inp = document.querySelector<HTMLInputElement>('input[type="search"], input.input, input[placeholder*="Filter"], input[placeholder*="filter"], input[placeholder*="Search"]');
+      if (inp) { inp.focus(); e.preventDefault(); }
+    } else if (e.key === 'n') {
+      goto('/upload');
+    } else if (e.key === 'g') {
+      // wait for second key
+      const handler = (e2: KeyboardEvent) => {
+        if (e2.key === 'd') goto('/data');
+        else if (e2.key === 'q') goto('/queue');
+        else if (e2.key === 'c') goto('/chat');
+        else if (e2.key === 'u') goto('/upload');
+        window.removeEventListener('keydown', handler);
+      };
+      window.addEventListener('keydown', handler, { once: true });
+      setTimeout(() => window.removeEventListener('keydown', handler), 1500);
+    } else if (e.key === '?') {
+      shortcutHelp = !shortcutHelp;
+    }
+  }
+  let shortcutHelp = $state(false);
 </script>
+
+<svelte:window onkeydown={onGlobalKey} />
 
 {#if isLoginRoute}
   {@render children()}
@@ -96,6 +182,46 @@
       <button class="install-btn" onclick={triggerInstall}>Install</button>
       <button class="install-dismiss" onclick={dismissInstall} aria-label="dismiss">×</button>
     </div>
+  </div>
+{/if}
+{#if showIosHint}
+  <div class="ios-hint" role="region" aria-label="Add to Home Screen">
+    <span class="ios-icon">📲</span>
+    <div class="ios-text">
+      Install KONTACT on iPhone — tap
+      <span class="ios-share-icon" aria-hidden="true">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+      </span>
+      then "Add to Home Screen"
+    </div>
+    <button class="install-dismiss" onclick={dismissIosHint} aria-label="dismiss">×</button>
+  </div>
+{/if}
+{#if shortcutHelp}
+  <div class="sk-backdrop" onclick={() => shortcutHelp = false} role="presentation">
+    <div class="sk-modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-label="Keyboard shortcuts">
+      <h3>Keyboard shortcuts</h3>
+      <dl>
+        <dt><kbd>/</kbd></dt><dd>Focus search</dd>
+        <dt><kbd>n</kbd></dt><dd>New upload</dd>
+        <dt><kbd>g</kbd> <kbd>d</kbd></dt><dd>Go to Data</dd>
+        <dt><kbd>g</kbd> <kbd>q</kbd></dt><dd>Go to Queue</dd>
+        <dt><kbd>g</kbd> <kbd>c</kbd></dt><dd>Go to Chat</dd>
+        <dt><kbd>g</kbd> <kbd>u</kbd></dt><dd>Go to Upload</dd>
+        <dt><kbd>?</kbd></dt><dd>Toggle this help</dd>
+        <dt><kbd>Esc</kbd></dt><dd>Close modals</dd>
+      </dl>
+      <button class="install-btn" onclick={() => shortcutHelp = false}>Close</button>
+    </div>
+  </div>
+{/if}
+{#if showWhatsNew}
+  <div class="whatsnew-banner" role="region" aria-label="What's new">
+    <span class="wn-icon">✨</span>
+    <div class="wn-text">
+      <strong>What's new</strong> — Company names auto-filled · Photos load faster · New Pending Merges tab to review duplicates
+    </div>
+    <button class="wn-dismiss" onclick={dismissWhatsNew} aria-label="dismiss">×</button>
   </div>
 {/if}
 <div class="app-shell">
@@ -159,25 +285,14 @@
             </svg>
           {/if}
           <span class="nav-label">{tab.label}</span>
+          {#if activeJobsForKey(tab.key) > 0}
+            <span class="nav-badge spin" title="{activeJobsForKey(tab.key)} upload(s) in progress">{activeJobsForKey(tab.key)}</span>
+          {:else if tab.key === 'upload' && needsForceCount() > 0}
+            <span class="nav-badge warn" title="{needsForceCount()} need(s) confirmation">!</span>
+          {/if}
         </button>
       {/each}
 
-      {#if auth.isAdmin}
-        <button
-          class="nav-item"
-          class:active={currentPath.startsWith('/users')}
-          onclick={() => navigateTo('/users')}
-          aria-label="Users"
-        >
-          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-            <circle cx="9" cy="7" r="4"/>
-            <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-          </svg>
-          <span class="nav-label">Users</span>
-        </button>
-      {/if}
     </nav>
 
     <div class="sidebar-footer">
@@ -336,12 +451,18 @@
             </svg>
           {/if}
           <span>{tab.label}</span>
+          {#if activeJobsForKey(tab.key) > 0}
+            <span class="mob-badge spin">{activeJobsForKey(tab.key)}</span>
+          {:else if tab.key === 'upload' && needsForceCount() > 0}
+            <span class="mob-badge warn">!</span>
+          {/if}
         </button>
       {/each}
     </nav>
   </div>
 </div>
 <UploadTray />
+<UndoStack />
 {/if}
 
 <style>
@@ -504,6 +625,37 @@
       flex-shrink: 0;
     }
 
+    .nav-badge {
+      margin-left: auto;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 5px;
+      border-radius: 9px;
+      background: var(--accent, #c96442);
+      color: white;
+      font-size: 10px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+    }
+    .nav-badge.warn { background: #e0a800; }
+    .nav-badge.spin { animation: nav-pulse 1.4s ease-in-out infinite; }
+    .mob-badge {
+      position: absolute; top: 4px; right: 8px;
+      min-width: 16px; height: 16px; padding: 0 4px;
+      border-radius: 8px; background: var(--accent, #c96442); color: white;
+      font-size: 9px; font-weight: 700;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+    .mob-badge.warn { background: #e0a800; }
+    .mob-badge.spin { animation: nav-pulse 1.4s ease-in-out infinite; }
+    @keyframes nav-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(201,100,66,0.5); }
+      50% { box-shadow: 0 0 0 4px rgba(201,100,66,0); }
+    }
+
     .nav-item:hover {
       background: var(--surface, rgba(0,0,0,0.04));
       color: var(--text, var(--color-on-surface));
@@ -664,6 +816,7 @@
   }
 
   .nav-bottom button {
+    position: relative;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -704,6 +857,69 @@
     .nav-bottom button span {
       display: none;
     }
+  }
+
+  .sk-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 200;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .sk-modal {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg);
+    padding: 20px; max-width: 360px; box-shadow: 0 10px 32px rgba(0,0,0,0.2);
+  }
+  .sk-modal h3 { margin: 0 0 12px; font-size: 16px; }
+  .sk-modal dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; margin: 0 0 16px; font-size: 13px; }
+  .sk-modal dt { display: flex; gap: 4px; }
+  .sk-modal dd { margin: 0; color: var(--text-muted); }
+  kbd {
+    display: inline-block; padding: 2px 6px; border: 1px solid var(--border);
+    border-bottom-width: 2px; border-radius: 4px; font-size: 11px; font-family: var(--font-mono);
+    background: var(--surface-2, var(--surface));
+  }
+
+  .whatsnew-banner {
+    position: sticky;
+    top: 0;
+    z-index: 99;
+    background: linear-gradient(90deg, rgba(201,100,66,0.12), rgba(201,100,66,0.04));
+    border-bottom: 1px solid var(--accent);
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+  }
+  .wn-icon { font-size: 16px; }
+  .wn-text { flex: 1; color: var(--text); }
+  .wn-dismiss {
+    background: transparent; border: none; color: var(--text-muted);
+    font-size: 20px; cursor: pointer; padding: 0 6px;
+  }
+  .wn-dismiss:hover { color: var(--text); }
+
+  .ios-hint {
+    position: fixed;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface);
+    border: 1px solid var(--accent);
+    border-radius: var(--r-lg, 12px);
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.18);
+    z-index: 101;
+    font-size: 14px;
+    max-width: 92vw;
+  }
+  .ios-icon { font-size: 20px; }
+  .ios-text { flex: 1; line-height: 1.4; }
+  .ios-share-icon {
+    display: inline-flex; vertical-align: middle;
+    color: var(--accent);
+    margin: 0 2px;
   }
 
   .install-banner {

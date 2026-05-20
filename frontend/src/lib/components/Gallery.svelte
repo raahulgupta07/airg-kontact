@@ -170,7 +170,18 @@
             onclick={() => openLightbox(doc, imageDocs().indexOf(doc))}
             title={doc.source_file}
           >
-            <img src="{API}/api/image/{doc.folder}/{doc.source_file}" alt={doc.source_file} loading="lazy" />
+            <img
+              src="{API}/api/thumb/{doc.folder}/{doc.source_file}?w=256"
+              alt={doc.source_file}
+              loading="lazy"
+              decoding="async"
+              onerror={(e) => {
+                const t = e.currentTarget as HTMLImageElement;
+                t.style.opacity = '0.15';
+                t.dataset.failed = '1';
+              }}
+              onload={(e) => { (e.currentTarget as HTMLImageElement).style.opacity = '1'; }}
+            />
             {#if groupMode === 'none'}
               {@const cat = docCategory(doc)}
               {#if cat && cat !== 'Uncategorized'}

@@ -87,6 +87,7 @@
                   {:else if job.status === 'uploading'}{job.progress}%
                   {:else if job.status === 'done'}done · {fmtBytes(job.compressedSize ?? job.size)}
                   {:else if job.status === 'error'}{job.error || 'failed'}
+                  {:else if job.status === 'needs_force'}{job.error || 'duplicate filename'}
                   {:else if job.status === 'cancelled'}cancelled
                   {/if}
                 </div>
@@ -97,6 +98,9 @@
               <div class="tr-actions">
                 {#if job.status === 'error'}
                   <button class="icon-btn small" onclick={() => uploadQueue.retry(job.id)} title="Retry">↻</button>
+                {:else if job.status === 'needs_force'}
+                  <button class="icon-btn small primary" onclick={() => uploadQueue.forceRetry(job.id)} title="Re-upload anyway">↻!</button>
+                  <button class="icon-btn small" onclick={() => uploadQueue.dismissDuplicate(job.id)} title="Skip">✕</button>
                 {:else if job.status === 'queued' || job.status === 'uploading' || job.status === 'compressing'}
                   <button class="icon-btn small" onclick={() => uploadQueue.cancel(job.id)} title="Cancel">✕</button>
                 {:else if job.status === 'done' && job.batchId}

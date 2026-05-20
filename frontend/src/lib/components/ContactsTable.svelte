@@ -22,8 +22,14 @@
     return contacts.filter(c =>
       (c.company || '').toLowerCase().includes(q) ||
       (c.person || c.name || '').toLowerCase().includes(q) ||
-      (c.phone || '').toLowerCase().includes(q) ||
-      (c.email || '').toLowerCase().includes(q)
+      (c.phone || c.phone_e164 || '').toLowerCase().includes(q) ||
+      (c.email || '').toLowerCase().includes(q) ||
+      (c.website || '').toLowerCase().includes(q) ||
+      (c.address || '').toLowerCase().includes(q) ||
+      (c.owner_name || '').toLowerCase().includes(q) ||
+      (c.source_channel || '').toLowerCase().includes(q) ||
+      (c.backfill_source || '').toLowerCase().includes(q) ||
+      (c.uuid || '').toLowerCase().includes(q)
     );
   });
 </script>
@@ -48,7 +54,12 @@
           {#each filteredContacts as c}
             <tr>
               <td class="uuid-cell">{(c.uuid || '').slice(0, 8)}</td>
-              <td>{c.company || ''}</td>
+              <td>
+                {c.company || ''}
+                {#if c.backfill_source && c.company}
+                  <span class="bf-chip" title="Auto-filled by backfill: {c.backfill_source}">↻ {c.backfill_source}</span>
+                {/if}
+              </td>
               <td>{c.person || c.name || c.contact_name || ''}</td>
               <td>{c.phone || c.telephone || ''}</td>
               <td>{c.email || ''}</td>
@@ -101,6 +112,16 @@
   .src-wechat { background: rgba(7,193,96,0.1); color: #07c160; }
   .src-email { background: rgba(66,133,244,0.1); color: #4285f4; }
   .src-url { background: rgba(155,89,182,0.1); color: #9b59b6; }
+  .bf-chip {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: var(--r-pill);
+    font-size: 10px;
+    background: rgba(160, 160, 160, 0.15);
+    color: var(--text-muted);
+    font-weight: 500;
+  }
   .src-api { background: var(--surface-2); color: var(--text-muted); }
   .actions-cell { white-space: nowrap; }
   .btn-ghost.xs { padding: 4px 10px; font-size: 11px; min-height: 24px; margin-right: 4px; }

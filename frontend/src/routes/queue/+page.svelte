@@ -1,5 +1,8 @@
 <script>
   import { goto } from '$app/navigation';
+  import Skeleton from '$lib/components/Skeleton.svelte';
+  import EmptyState from '$lib/components/EmptyState.svelte';
+  import PullRefresh from '$lib/components/PullRefresh.svelte';
 
   let batches = $state([]);
   let loading = $state(true);
@@ -202,11 +205,16 @@
     </div>
   </div>
 
-  {#if batches.length === 0 && !loading}
-    <div class="q-empty">
-      <p>No batches yet</p>
-      <button class="send-btn" onclick={() => goto('/upload')}>Upload images</button>
-    </div>
+  {#if loading && batches.length === 0}
+    <Skeleton kind="card" rows={4} />
+  {:else if batches.length === 0}
+    <EmptyState
+      icon="📦"
+      title="No batches yet"
+      hint="Photos you upload appear here. Each upload becomes a batch you can track from queue → extracted → searchable."
+      cta="Upload your first batch"
+      oncta={() => goto('/upload')}
+    />
   {:else}
     <div class="q-list">
       {#each batches as batch (batch.batch_id)}
@@ -288,9 +296,10 @@
                     >
                       <div class="q-thumb-skeleton"></div>
                       <img
-                        src={`/api/image/${doc.folder}/${doc.source_file}`}
+                        src={`/api/thumb/${doc.folder}/${doc.source_file}?w=256`}
                         alt={doc.source_file}
                         loading="lazy"
+                        decoding="async"
                         onload={(e) => { e.target.style.opacity = '1'; e.target.previousElementSibling.style.display = 'none'; }}
                         onerror={(e) => { e.target.style.display = 'none'; e.target.previousElementSibling.style.background = 'var(--surface-2)'; }}
                       />

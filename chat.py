@@ -86,6 +86,11 @@ You can invoke tools by outputting a JSON block in this exact format:
 - **query_catalog_db** -- Run a read-only SQL SELECT on the catalog database. Argument: {"sql": "..."}
 - **introspect_schema** -- Get the full database schema. No arguments needed.
 - **get_catalog_summary** -- Get a high-level overview of all companies, document types, and folders. No arguments needed.
+- **semantic_search_images** -- Find catalog images by free-text semantic content (e.g. "red shoes", "industrial pumps", "wechat qr code"). Use this FIRST for visual/topical questions. Returns markdown with [IMAGE: folder/file] citations the UI renders as thumbs. Argument: {"query": "...", "limit": 8}
+
+[TOOL: semantic_search_images]
+{"query": "red shoes", "limit": 6}
+[/TOOL]
 
 ### Tables available:
 
@@ -233,7 +238,20 @@ async def _call_llm(messages: list, max_tokens: int = 2000, temperature: float =
                     await asyncio.sleep(2 ** attempt)
                     continue
                 r.raise_for_status()
-                return r.json()["choices"][0]["message"]["content"]
+                body = r.json()
+                try:
+                    import database as _db
+                    usage = body.get("usage") or {}
+                    _db.log_llm_usage(
+                        user_uuid=None,
+                        op="chat",
+                        model=payload.get("model", "unknown"),
+                        prompt_tokens=usage.get("prompt_tokens", 0),
+                        completion_tokens=usage.get("completion_tokens", 0),
+                    )
+                except Exception:
+                    pass
+                return body["choices"][0]["message"]["content"]
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
                 last_err = e
                 await asyncio.sleep(2 ** attempt)

@@ -1,7 +1,7 @@
 // Global upload queue — persistent across route navigation.
 // Each enqueued file gets its own xhr. Concurrency cap keeps phone uplink sane.
 
-export type UploadStatus = 'queued' | 'compressing' | 'uploading' | 'done' | 'error' | 'cancelled';
+export type UploadStatus = 'queued' | 'compressing' | 'uploading' | 'done' | 'error' | 'cancelled' | 'needs_force';
 
 export interface UploadJob {
   id: string;
@@ -18,6 +18,8 @@ export interface UploadJob {
   xhr?: XMLHttpRequest;
   startedAt?: number;
   doneAt?: number;
+  force?: boolean;            // override duplicate-filename guard
+  duplicateBatchId?: string;  // set when server returned skipped reason
 }
 
 const MAX_PARALLEL = 2;
@@ -121,6 +123,24 @@ class UploadQueueState {
     this.pump();
   }
 
+  forceRetry(id: string) {
+    const j = this.jobs.find(x => x.id === id);
+    if (!j || j.status !== 'needs_force') return;
+    j.force = true;
+    j.status = 'queued';
+    j.progress = 0;
+    j.error = undefined;
+    this.jobs = [...this.jobs];
+    this.pump();
+  }
+
+  dismissDuplicate(id: string) {
+    const j = this.jobs.find(x => x.id === id);
+    if (!j) return;
+    j.status = 'cancelled';
+    this.jobs = [...this.jobs];
+  }
+
   retryOfflineErrors() {
     let any = false;
     for (const j of this.jobs) {
@@ -169,6 +189,7 @@ class UploadQueueState {
     const sendFile = blob instanceof File ? blob : new File([blob], job.name.replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' });
     fd.append('files', sendFile);
     if (job.tradeShow) fd.append('trade_show', job.tradeShow);
+    if (job.force) fd.append('force', '1');
 
     const xhr = new XMLHttpRequest();
     job.xhr = xhr;
@@ -182,9 +203,20 @@ class UploadQueueState {
       if (xhr.status >= 200 && xhr.status < 300) {
         try { job.result = JSON.parse(xhr.responseText); } catch { job.result = {}; }
         job.batchId = job.result?.batch_id;
-        job.status = 'done';
-        job.progress = 100;
-        job.doneAt = Date.now();
+        // Detect duplicate-filename guard skip
+        const skipped = Array.isArray(job.result?.skipped) ? job.result.skipped : [];
+        const dup = skipped.find((s: any) =>
+          typeof s?.reason === 'string' && s.reason.toLowerCase().includes('duplicate filename')
+        );
+        if (dup && !job.force) {
+          job.status = 'needs_force';
+          job.duplicateBatchId = dup.existing_batch_id;
+          job.error = `Already uploaded recently (batch ${dup.existing_batch_id?.slice(0,8) || '?'}). Re-upload anyway?`;
+        } else {
+          job.status = 'done';
+          job.progress = 100;
+          job.doneAt = Date.now();
+        }
       } else {
         job.status = 'error';
         job.error = `Server ${xhr.status}`;

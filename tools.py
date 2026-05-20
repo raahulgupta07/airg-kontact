@@ -585,10 +585,98 @@ def list_messenger_contacts(platform: str) -> str:
         conn.close()
 
 
+def semantic_search_images(query: str, limit: int = 8, user: dict = None) -> str:
+    """Find catalog images by semantic content.
+
+    Uses ChromaDB vector store. Returns markdown w/ [IMAGE: folder/file]
+    citations the frontend renders as clickable thumbs. Per-user scoped via
+    document join — admin sees all.
+
+    Args:
+        query: free-text search ("red shoes", "industrial pumps", "wechat qr").
+        limit: max results (default 8, max 20).
+        user: current user dict (injected by execute_tool).
+    """
+    import vectorstore as _vs
+    import database as _db
+
+    if not query or not query.strip():
+        return "_Empty query._"
+    limit = max(1, min(int(limit or 8), 20))
+    try:
+        hits = _vs.query(query.strip(), n_results=limit * 2)  # over-fetch then filter
+    except Exception as e:
+        return f"_Vector search error: {e}_"
+    if not hits:
+        return "_No semantic matches._"
+
+    # Gather folder/file pairs to look up doc + owner
+    folder_files = []
+    for h in hits:
+        meta = h.get("metadata") or {}
+        folder = meta.get("folder")
+        fname = meta.get("source_file") or meta.get("file")
+        if folder and fname:
+            folder_files.append((folder, fname))
+    if not folder_files:
+        return "_Matches lack folder/file metadata._"
+
+    is_admin = (user or {}).get("role") in ("super_admin", "admin")
+    user_uuid = (user or {}).get("uuid")
+
+    conn = _db._conn()
+    try:
+        placeholders = ",".join(["(?, ?)"] * len(folder_files))
+        flat = [v for pair in folder_files for v in pair]
+        if is_admin:
+            rows = conn.execute(
+                f"SELECT folder, source_file, company, title, image_type, trade_show "
+                f"FROM documents WHERE (folder, source_file) IN (VALUES {placeholders})",
+                flat,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT folder, source_file, company, title, image_type, trade_show "
+                f"FROM documents WHERE (folder, source_file) IN (VALUES {placeholders}) "
+                f"AND owner_uuid = ?",
+                flat + [user_uuid],
+            ).fetchall()
+    finally:
+        conn.close()
+
+    # Build markdown ordered by original semantic hit order
+    by_key = {(r["folder"], r["source_file"]): dict(r) for r in rows}
+    lines = ["**Image matches:**", ""]
+    seen = set()
+    shown = 0
+    for folder, fname in folder_files:
+        if (folder, fname) in seen:
+            continue
+        seen.add((folder, fname))
+        d = by_key.get((folder, fname))
+        if not d:
+            continue  # filtered out by ownership
+        bits = []
+        if d.get("company"): bits.append(d["company"])
+        if d.get("title"): bits.append(d["title"])
+        if d.get("image_type"): bits.append(f"`{d['image_type']}`")
+        if d.get("trade_show"): bits.append(f"@ {d['trade_show']}")
+        desc = " · ".join(bits) or fname
+        lines.append(f"- {desc}  [IMAGE: {folder}/{fname}]")
+        shown += 1
+        if shown >= limit:
+            break
+
+    if shown == 0:
+        return "_No matches visible to your account._"
+    return "\n".join(lines)
+
+
 TOOLS = {
     "query_catalog_db": query_catalog_db,
     "introspect_schema": introspect_schema,
     "get_catalog_summary": get_catalog_summary,
+    "semantic_search_images": semantic_search_images,
     "open_messenger": open_messenger,
     "fetch_catalog_url": fetch_catalog_url,
     "find_unmapped_wechat_chats": find_unmapped_wechat_chats,
@@ -607,7 +695,7 @@ def execute_tool(name: str, args: dict, user: dict = None) -> str:
         return f"Error: Unknown tool `{name}`."
     try:
         # Inject user into tools that accept it
-        if name == "query_catalog_db":
+        if name in ("query_catalog_db", "semantic_search_images"):
             return fn(user=user, **args)
         return fn(**args)
     except Exception as e:

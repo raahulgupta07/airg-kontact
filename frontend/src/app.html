@@ -7,15 +7,40 @@
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300..700&display=swap" rel="stylesheet" />
   <title>KONTACT</title>
   <link rel="manifest" href="/manifest.json" />
-  <meta name="theme-color" content="#383832" />
+  <meta name="theme-color" content="#c96442" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#1c1c1a" media="(prefers-color-scheme: dark)" />
+  <meta name="application-name" content="KONTACT" />
+  <meta name="description" content="Catalog vision RAG for trade-show teams" />
+
   <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-  <link rel="apple-touch-icon" href="/icon.svg" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+  <link rel="icon" type="image/png" sizes="512x512" href="/icons/icon-512.png" />
+
+  <!-- iOS -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="KONTACT" />
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon-180.png" />
+  <link rel="apple-touch-icon" sizes="152x152" href="/icons/apple-touch-icon-152.png" />
+  <link rel="apple-touch-icon" sizes="167x167" href="/icons/apple-touch-icon-167.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon-180.png" />
+  <link rel="apple-touch-startup-image" href="/icons/splash-1290x2796.png" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3)" />
+  <link rel="apple-touch-startup-image" href="/icons/splash-1170x2532.png" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3)" />
+  <link rel="apple-touch-startup-image" href="/icons/splash-1125x2436.png" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3)" />
+
   <script>
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js');
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
       });
     }
+    // Mark standalone mode early so CSS can react
+    try {
+      if (window.matchMedia('(display-mode: standalone)').matches || (window.navigator).standalone) {
+        document.documentElement.classList.add('pwa-standalone');
+      }
+    } catch (e) {}
   </script>
   %sveltekit.head%
 </head>

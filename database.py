@@ -1,4 +1,4 @@
-import sqlite3, json, os, hashlib
+import sqlite3, json, os, hashlib, threading, queue, atexit
 from uuid import uuid4
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -6,14 +6,74 @@ import config
 
 DB_PATH = os.path.join(config.DATA_DIR, "kontact.db")
 
+# ─── Connection pool (SQLite WAL — many readers + 1 writer) ──────────────
+# Tuned for 20 concurrent users. WAL allows concurrent reads; writes queue
+# via busy_timeout. Pool reuses connections to skip open/pragma overhead.
+_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "16"))
+_pool: "queue.Queue[sqlite3.Connection]" = queue.Queue(maxsize=_POOL_SIZE)
+_pool_lock = threading.Lock()
+_pool_created = 0
 
-def _conn():
-    c = sqlite3.connect(DB_PATH)
+
+class _PooledConn(sqlite3.Connection):
+    """sqlite3.Connection subclass — .close() returns to pool."""
+    def close(self):  # type: ignore[override]
+        try:
+            if self.in_transaction:
+                self.rollback()
+        except Exception:
+            pass
+        try:
+            _pool.put_nowait(self)
+        except queue.Full:
+            super().close()
+
+    def _real_close(self):
+        super().close()
+
+
+def _build_conn() -> sqlite3.Connection:
+    # Default deferred isolation — c.commit() works as code expects.
+    c = sqlite3.connect(
+        DB_PATH, check_same_thread=False, timeout=30, factory=_PooledConn,
+    )
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA busy_timeout=30000")
     c.execute("PRAGMA foreign_keys=ON")
+    c.execute("PRAGMA synchronous=NORMAL")        # WAL-safe; faster than FULL
+    c.execute("PRAGMA temp_store=MEMORY")
+    c.execute("PRAGMA cache_size=-20000")         # ~20 MB page cache
+    c.execute("PRAGMA wal_autocheckpoint=1000")
     return c
+
+
+def _conn() -> sqlite3.Connection:
+    """Return pooled connection. Call .close() to return to pool."""
+    global _pool_created
+    try:
+        return _pool.get_nowait()
+    except queue.Empty:
+        pass
+    with _pool_lock:
+        if _pool_created < _POOL_SIZE:
+            c = _build_conn()
+            _pool_created += 1
+            return c
+    return _pool.get(timeout=10)
+
+
+@atexit.register
+def _drain_pool():
+    while True:
+        try:
+            c = _pool.get_nowait()
+            try:
+                c._real_close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        except queue.Empty:
+            break
 
 
 @contextmanager
@@ -167,6 +227,54 @@ def _migrate_columns(c):
     _add_column(c, "contacts", "source_channel TEXT DEFAULT 'upload'")
     _add_column(c, "contacts", "edit_count INTEGER DEFAULT 0")
     _add_column(c, "contacts", "owner_name TEXT")
+    _add_column(c, "contacts", "backfill_source TEXT")
+    _add_column(c, "documents", "quality_score REAL")
+    _add_column(c, "documents", "needs_revision INTEGER DEFAULT 0")
+    # cron_config — admin-editable job schedules
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS cron_config (
+            job_id TEXT PRIMARY KEY,
+            cron_hour INTEGER,                -- 0-23 or NULL for interval-based
+            cron_minute INTEGER DEFAULT 0,
+            interval_hours INTEGER,           -- alt: interval-based job
+            enabled INTEGER DEFAULT 1,
+            updated_at TEXT,
+            updated_by TEXT
+        );
+    """)
+    # Seed defaults (idempotent)
+    _seed_defaults = [
+        ("vs_prune",        None,  0,    24, 1),   # every 24h
+        ("backfill_cheap",  2,     0,    None, 1),
+        ("dedup_scan",      4,     0,    None, 1),
+        ("ts_summary",      5,     0,    None, 1),
+        ("backfill_llm",    None,  0,    None, 0), # disabled by default
+    ]
+    for jid, hh, mm, iv, en in _seed_defaults:
+        c.execute(
+            "INSERT OR IGNORE INTO cron_config "
+            "(job_id, cron_hour, cron_minute, interval_hours, enabled, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (jid, hh, mm, iv, en, _now_iso()),
+        )
+
+    # llm_usage table — track tokens + cost per call
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS llm_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            user_uuid TEXT,
+            op TEXT NOT NULL,           -- 'extract' | 'chat' | 'categorize' | 'backfill'
+            model TEXT,
+            prompt_tokens INTEGER DEFAULT 0,
+            completion_tokens INTEGER DEFAULT 0,
+            total_tokens INTEGER DEFAULT 0,
+            cost_usd REAL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_ts ON llm_usage(ts);
+        CREATE INDEX IF NOT EXISTS idx_llm_user ON llm_usage(user_uuid, ts);
+        CREATE INDEX IF NOT EXISTS idx_llm_op ON llm_usage(op, ts);
+    """)
 
     _add_column(c, "products", "updated_at TEXT")
     _add_column(c, "products", "source_channel TEXT DEFAULT 'upload'")
@@ -385,6 +493,7 @@ def init_db():
 
     _migrate_auth_tables(c)
     _migrate_aux_tables(c)
+    _migrate_merge_tables(c)
 
     c.close()
 
@@ -692,6 +801,243 @@ def log_event_safe(event_type: str, entity_type: str = None, entity_uuid: str = 
         pass
 
 
+# LLM cost rates per 1M tokens. Update as OpenRouter pricing shifts.
+LLM_PRICING_USD_PER_M = {
+    # input, output
+    "google/gemini-3.1-flash-lite-preview": (0.075, 0.30),
+    "openai/text-embedding-3-small":        (0.02,  0.0),
+    "default":                              (0.30,  1.20),
+}
+
+
+def cron_config_list() -> list[dict]:
+    c = _conn()
+    try:
+        rows = c.execute("SELECT * FROM cron_config ORDER BY job_id").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        c.close()
+
+
+def cron_config_get(job_id: str) -> dict | None:
+    c = _conn()
+    try:
+        row = c.execute("SELECT * FROM cron_config WHERE job_id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        c.close()
+
+
+def cron_config_update(job_id: str, *, cron_hour=None, cron_minute=None,
+                       interval_hours=None, enabled=None, updated_by: str = None) -> dict:
+    c = _conn()
+    try:
+        cur = c.execute("SELECT * FROM cron_config WHERE job_id = ?", (job_id,)).fetchone()
+        if not cur:
+            raise ValueError(f"unknown job_id {job_id}")
+        updates = {}
+        if cron_hour is not None:     updates["cron_hour"] = int(cron_hour) if cron_hour != "" else None
+        if cron_minute is not None:   updates["cron_minute"] = int(cron_minute)
+        if interval_hours is not None: updates["interval_hours"] = int(interval_hours) if interval_hours != "" else None
+        if enabled is not None:       updates["enabled"] = int(bool(enabled))
+        if not updates:
+            return dict(cur)
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        params = list(updates.values()) + [_now_iso(), updated_by, job_id]
+        c.execute(
+            f"UPDATE cron_config SET {sets}, updated_at = ?, updated_by = ? WHERE job_id = ?",
+            params,
+        )
+        c.commit()
+        row = c.execute("SELECT * FROM cron_config WHERE job_id = ?", (job_id,)).fetchone()
+        return dict(row) if row else {}
+    finally:
+        c.close()
+
+
+def log_llm_usage(user_uuid: str, op: str, model: str,
+                  prompt_tokens: int = 0, completion_tokens: int = 0):
+    """Best-effort log. Never raises."""
+    try:
+        prompt_tokens = int(prompt_tokens or 0)
+        completion_tokens = int(completion_tokens or 0)
+        total = prompt_tokens + completion_tokens
+        rates = LLM_PRICING_USD_PER_M.get(model) or LLM_PRICING_USD_PER_M["default"]
+        cost = (prompt_tokens * rates[0] + completion_tokens * rates[1]) / 1_000_000
+        conn = _conn()
+        try:
+            conn.execute(
+                "INSERT INTO llm_usage "
+                "(ts, user_uuid, op, model, prompt_tokens, completion_tokens, total_tokens, cost_usd) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (_now_iso(), user_uuid, op, model, prompt_tokens, completion_tokens, total, cost),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def llm_cost_summary(days: int = 30, user_uuid: str = None) -> dict:
+    """Aggregate cost + tokens over period, grouped by day + op + user."""
+    conn = _conn()
+    try:
+        params: list = []
+        where = "WHERE ts >= datetime('now', ?)"
+        params.append(f"-{int(days)} day")
+        if user_uuid:
+            where += " AND user_uuid = ?"
+            params.append(user_uuid)
+        by_day = conn.execute(
+            f"SELECT date(ts) AS day, SUM(total_tokens) AS tokens, SUM(cost_usd) AS cost, COUNT(*) AS calls "
+            f"FROM llm_usage {where} GROUP BY date(ts) ORDER BY day DESC",
+            params,
+        ).fetchall()
+        by_op = conn.execute(
+            f"SELECT op, SUM(total_tokens) AS tokens, SUM(cost_usd) AS cost, COUNT(*) AS calls "
+            f"FROM llm_usage {where} GROUP BY op ORDER BY cost DESC",
+            params,
+        ).fetchall()
+        by_user = conn.execute(
+            f"SELECT COALESCE(u.name, 'unknown') AS name, l.user_uuid, "
+            f"SUM(l.total_tokens) AS tokens, SUM(l.cost_usd) AS cost, COUNT(*) AS calls "
+            f"FROM llm_usage l LEFT JOIN users u ON u.uuid = l.user_uuid {where.replace('ts', 'l.ts')} "
+            f"GROUP BY l.user_uuid ORDER BY cost DESC LIMIT 50",
+            params,
+        ).fetchall()
+        totals = conn.execute(
+            f"SELECT SUM(total_tokens) AS tokens, SUM(cost_usd) AS cost, COUNT(*) AS calls "
+            f"FROM llm_usage {where}",
+            params,
+        ).fetchone()
+        return {
+            "days": days,
+            "totals": dict(totals) if totals else {"tokens": 0, "cost": 0, "calls": 0},
+            "by_day": [dict(r) for r in by_day],
+            "by_op": [dict(r) for r in by_op],
+            "by_user": [dict(r) for r in by_user],
+        }
+    finally:
+        conn.close()
+
+
+def trade_show_summary(trade_show: str, user_uuid: str = None) -> dict:
+    """Build summary for a trade show — counts, top companies, contacts."""
+    if not trade_show:
+        return {}
+    conn = _conn()
+    try:
+        scope = ""
+        params: list = [trade_show]
+        if user_uuid:
+            scope = " AND owner_uuid = ?"
+            params.append(user_uuid)
+        totals_row = conn.execute(
+            f"SELECT COUNT(*) AS docs, COUNT(DISTINCT company) AS companies, "
+            f"MIN(created_at) AS first_seen, MAX(created_at) AS last_seen "
+            f"FROM documents WHERE trade_show = ?{scope}",
+            params,
+        ).fetchone()
+        top_companies = conn.execute(
+            f"SELECT company, COUNT(*) AS n FROM documents "
+            f"WHERE trade_show = ?{scope} AND company IS NOT NULL AND TRIM(company) != '' "
+            f"GROUP BY company ORDER BY n DESC LIMIT 10",
+            params,
+        ).fetchall()
+        contacts = conn.execute(
+            f"SELECT c.company, c.person, c.phone, c.email "
+            f"FROM contacts c JOIN documents d ON c.document_uuid = d.uuid "
+            f"WHERE d.trade_show = ?{scope} LIMIT 100",
+            params,
+        ).fetchall()
+        product_count = conn.execute(
+            f"SELECT COUNT(*) FROM products p JOIN documents d ON p.document_uuid = d.uuid "
+            f"WHERE d.trade_show = ?{scope}",
+            params,
+        ).fetchone()[0]
+        meetings_count = conn.execute(
+            f"SELECT COUNT(*) FROM meetings WHERE company IN "
+            f"(SELECT DISTINCT company FROM documents WHERE trade_show = ?{scope})",
+            params,
+        ).fetchone()[0]
+        return {
+            "trade_show": trade_show,
+            "totals": dict(totals_row) if totals_row else {},
+            "products": product_count,
+            "meetings": meetings_count,
+            "top_companies": [dict(r) for r in top_companies],
+            "contacts_sample": [dict(r) for r in contacts[:20]],
+            "contact_count": len(contacts),
+        }
+    finally:
+        conn.close()
+
+
+def usage_heatmap(days: int = 14, user_uuid: str = None) -> dict:
+    """Upload count by (day, hour) buckets."""
+    conn = _conn()
+    try:
+        params: list = [f"-{int(days)} day"]
+        where = "WHERE created_at >= datetime('now', ?)"
+        if user_uuid:
+            where += " AND owner_uuid = ?"
+            params.append(user_uuid)
+        rows = conn.execute(
+            f"SELECT strftime('%Y-%m-%d', created_at) AS day, "
+            f"strftime('%H', created_at) AS hour, COUNT(*) AS n "
+            f"FROM documents {where} GROUP BY day, hour ORDER BY day, hour",
+            params,
+        ).fetchall()
+        return {"days": days, "cells": [dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+def conversion_funnel(days: int = 30, user_uuid: str = None) -> dict:
+    """Counts: uploaded → extracted → contact_saved → meeting_created."""
+    conn = _conn()
+    try:
+        params: list = [f"-{int(days)} day"]
+        scope = ""
+        if user_uuid:
+            scope = " AND owner_uuid = ?"
+            params2 = params + [user_uuid]
+        else:
+            params2 = params
+        uploaded = conn.execute(
+            "SELECT COUNT(*) FROM queue WHERE created_at >= datetime('now', ?)" + scope,
+            params2,
+        ).fetchone()[0]
+        extracted = conn.execute(
+            "SELECT COUNT(*) FROM documents WHERE created_at >= datetime('now', ?)" + scope,
+            params2,
+        ).fetchone()[0]
+        if user_uuid:
+            ct_scope = " AND owner_uuid = ?"
+        else:
+            ct_scope = ""
+        contacts_saved = conn.execute(
+            "SELECT COUNT(*) FROM contacts WHERE created_at >= datetime('now', ?)" + ct_scope,
+            params2 if user_uuid else params,
+        ).fetchone()[0]
+        meetings = conn.execute(
+            "SELECT COUNT(*) FROM meetings WHERE created_at >= datetime('now', ?)" + (
+                " AND owner_uuid = ?" if user_uuid else ""
+            ),
+            params2 if user_uuid else params,
+        ).fetchone()[0]
+        return {
+            "days": days,
+            "uploaded": uploaded,
+            "extracted": extracted,
+            "contacts_saved": contacts_saved,
+            "meetings_created": meetings,
+        }
+    finally:
+        conn.close()
+
+
 def list_events(c, limit: int = 100, user_uuid: str = None, event_type: str = None,
                 requester=None):
     where = []
@@ -718,6 +1064,335 @@ def list_events(c, limit: int = 100, user_uuid: str = None, event_type: str = No
 def backfill_aux_tables(c=None):
     """No-op currently — tables created empty. Just log."""
     print("[aux] notes/meetings/tags/events tables ready")
+
+
+def _migrate_merge_tables(c):
+    """Create merge_proposals + merge_blacklist for human-approved dedup."""
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS merge_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT UNIQUE NOT NULL,
+            entity_type TEXT NOT NULL,       -- 'contact' | 'document'
+            keep_uuid TEXT NOT NULL,
+            drop_uuid TEXT NOT NULL,
+            match_reason TEXT NOT NULL,      -- phone_e164|email|company_person|file_hash|phash|filename
+            confidence REAL DEFAULT 0,
+            status TEXT DEFAULT 'pending',   -- pending|approved|rejected|undone
+            proposed_by TEXT DEFAULT 'auto_cron',
+            reviewed_by TEXT,
+            reviewed_at TEXT,
+            before_snapshot TEXT,            -- JSON of drop row pre-merge
+            after_snapshot TEXT,             -- JSON post-merge (for undo)
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mp_status ON merge_proposals(status);
+        CREATE INDEX IF NOT EXISTS idx_mp_entity ON merge_proposals(entity_type, status);
+        CREATE INDEX IF NOT EXISTS idx_mp_pair ON merge_proposals(keep_uuid, drop_uuid);
+
+        CREATE TABLE IF NOT EXISTS merge_blacklist (
+            uuid_a TEXT NOT NULL,
+            uuid_b TEXT NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (uuid_a, uuid_b)
+        );
+    """)
+
+
+def merge_proposal_create(entity_type: str, keep_uuid: str, drop_uuid: str,
+                          match_reason: str, confidence: float,
+                          before_snapshot: dict,
+                          proposed_by: str = "auto_cron") -> str | None:
+    """Insert proposal. Returns proposal uuid, or None if blacklisted/duplicate."""
+    from uuid import uuid4 as _uuid4
+    import json as _json
+    a, b = sorted([keep_uuid, drop_uuid])
+    c = _conn()
+    try:
+        bl = c.execute(
+            "SELECT 1 FROM merge_blacklist WHERE uuid_a = ? AND uuid_b = ?",
+            (a, b),
+        ).fetchone()
+        if bl:
+            return None
+        # Skip if pending or approved already exists for same pair
+        dup = c.execute(
+            "SELECT uuid FROM merge_proposals "
+            "WHERE entity_type = ? AND status IN ('pending', 'approved') "
+            "AND ((keep_uuid = ? AND drop_uuid = ?) OR (keep_uuid = ? AND drop_uuid = ?))",
+            (entity_type, keep_uuid, drop_uuid, drop_uuid, keep_uuid),
+        ).fetchone()
+        if dup:
+            return None
+        proposal_uuid = str(_uuid4())
+        c.execute(
+            """
+            INSERT INTO merge_proposals
+            (uuid, entity_type, keep_uuid, drop_uuid, match_reason, confidence,
+             status, proposed_by, before_snapshot, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (proposal_uuid, entity_type, keep_uuid, drop_uuid, match_reason,
+             float(confidence), proposed_by,
+             _json.dumps(before_snapshot, ensure_ascii=False, default=str),
+             _now_iso()),
+        )
+        c.commit()
+        return proposal_uuid
+    finally:
+        c.close()
+
+
+def _enrich_doc_preview(d: dict, c) -> dict:
+    """Add summary fields (products_count, contact_summary, raw_text_snippet)."""
+    # Parse JSON columns
+    products = d.get("products")
+    if isinstance(products, str):
+        try: products = json.loads(products)
+        except Exception: products = []
+    if not isinstance(products, list): products = []
+    d["products_count"] = len(products)
+    d["products_summary"] = [
+        (p.get("name") or p.get("product_name") or "")
+        for p in products[:5] if isinstance(p, dict)
+    ]
+    contact = d.get("contact")
+    if isinstance(contact, str):
+        try: contact = json.loads(contact)
+        except Exception: contact = {}
+    if not isinstance(contact, dict): contact = {}
+    d["contact_summary"] = {
+        "person": contact.get("person") or "",
+        "phone":  contact.get("phone") or contact.get("phone_e164") or "",
+        "email":  contact.get("email") or "",
+    }
+    raw = (d.get("raw_text") or "").strip()
+    d["raw_text_snippet"] = raw[:160] + ("…" if len(raw) > 160 else "")
+    d["has_gps"] = bool(d.get("gps_lat"))
+    # Drop bulky raw_text/products/contact JSON from response (we kept summaries)
+    d.pop("raw_text", None)
+    d.pop("products", None)
+    d.pop("contact", None)
+    return d
+
+
+def merge_proposal_clusters(status: str = "pending", entity_type: str | None = None,
+                            min_confidence: float = 0.0, limit: int = 100) -> list[dict]:
+    """Group pending proposals by keep_uuid + match_reason.
+
+    Returns list of clusters:
+      {keep_uuid, match_reason, entity_type, confidence_avg, drop_count,
+       keep_preview: dict, drops: [{uuid, snapshot_preview, proposal_uuid}, …]}
+
+    UI shows one card per cluster → single "merge all" button.
+    """
+    c = _conn()
+    try:
+        where = ["status = ?", "confidence >= ?"]
+        params: list = [status, min_confidence]
+        if entity_type:
+            where.append("entity_type = ?")
+            params.append(entity_type)
+        rows = c.execute(
+            f"SELECT * FROM merge_proposals WHERE {' AND '.join(where)} "
+            f"ORDER BY confidence DESC, created_at DESC",
+            params,
+        ).fetchall()
+
+        # Group by (keep_uuid, match_reason)
+        groups: dict[tuple, dict] = {}
+        for r in rows:
+            key = (r["keep_uuid"], r["match_reason"])
+            if key not in groups:
+                groups[key] = {
+                    "keep_uuid": r["keep_uuid"],
+                    "match_reason": r["match_reason"],
+                    "entity_type": r["entity_type"],
+                    "confidences": [],
+                    "drops": [],
+                    "proposal_uuids": [],
+                }
+            g = groups[key]
+            g["confidences"].append(r["confidence"])
+            g["proposal_uuids"].append(r["uuid"])
+            try:
+                snap = json.loads(r["before_snapshot"]) if r["before_snapshot"] else {}
+            except Exception:
+                snap = {}
+            if r["entity_type"] == "document" and isinstance(snap, dict):
+                try:
+                    snap = _enrich_doc_preview(snap, None)
+                except Exception:
+                    pass
+            g["drops"].append({
+                "proposal_uuid": r["uuid"],
+                "drop_uuid": r["drop_uuid"],
+                "snapshot": snap,
+            })
+
+        # Fetch keep previews
+        out = []
+        for (keep_uuid, reason), g in groups.items():
+            ent = g["entity_type"]
+            keep_preview = {}
+            if ent == "document":
+                row = c.execute(
+                    "SELECT uuid, folder, source_file, company, title, image_type, "
+                    "image_phash, file_hash, trade_show, file_size_kb, created_at, "
+                    "raw_text, products, contact, gps_lat, gps_lng, country, city, "
+                    "quality_score, needs_revision, date_taken, camera_make, owner_uuid "
+                    "FROM documents WHERE uuid = ?", (keep_uuid,)
+                ).fetchone()
+                if row:
+                    keep_preview = dict(row)
+                    keep_preview = _enrich_doc_preview(keep_preview, c)
+            elif ent == "contact":
+                row = c.execute(
+                    "SELECT uuid, company, person, phone, phone_e164, email, website, address, "
+                    "messengers, owner_name, created_at, document_uuid, source_channel, edit_count "
+                    "FROM contacts WHERE uuid = ?", (keep_uuid,)
+                ).fetchone()
+                if row:
+                    keep_preview = dict(row)
+            confs = g["confidences"]
+            avg_conf = sum(confs) / max(len(confs), 1)
+            out.append({
+                "keep_uuid": keep_uuid,
+                "match_reason": reason,
+                "entity_type": ent,
+                "confidence": round(avg_conf, 3),
+                "drop_count": len(g["drops"]),
+                "keep_preview": keep_preview,
+                "drops": g["drops"],
+                "proposal_uuids": g["proposal_uuids"],
+            })
+
+        # Sort: biggest cluster first, then highest confidence
+        out.sort(key=lambda x: (-x["drop_count"], -x["confidence"]))
+        return out[:limit]
+    finally:
+        c.close()
+
+
+def merge_proposal_list(status: str = "pending", entity_type: str | None = None,
+                        min_confidence: float = 0.0, limit: int = 500) -> list[dict]:
+    c = _conn()
+    try:
+        where = ["status = ?", "confidence >= ?"]
+        params: list = [status, min_confidence]
+        if entity_type:
+            where.append("entity_type = ?")
+            params.append(entity_type)
+        params.append(limit)
+        rows = c.execute(
+            f"SELECT * FROM merge_proposals WHERE {' AND '.join(where)} "
+            "ORDER BY confidence DESC, created_at DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        c.close()
+
+
+def merge_proposal_get(proposal_uuid: str) -> dict | None:
+    c = _conn()
+    try:
+        row = c.execute(
+            "SELECT * FROM merge_proposals WHERE uuid = ?",
+            (proposal_uuid,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        c.close()
+
+
+def merge_proposal_update_status(proposal_uuid: str, status: str,
+                                 reviewed_by: str | None = None,
+                                 after_snapshot: dict | None = None):
+    import json as _json
+    c = _conn()
+    try:
+        c.execute(
+            "UPDATE merge_proposals SET status = ?, reviewed_by = ?, reviewed_at = ?, "
+            "after_snapshot = COALESCE(?, after_snapshot) WHERE uuid = ?",
+            (status, reviewed_by, _now_iso(),
+             _json.dumps(after_snapshot, ensure_ascii=False, default=str) if after_snapshot else None,
+             proposal_uuid),
+        )
+        c.commit()
+    finally:
+        c.close()
+
+
+def merge_blacklist_add(uuid_a: str, uuid_b: str, reason: str = "rejected"):
+    a, b = sorted([uuid_a, uuid_b])
+    c = _conn()
+    try:
+        c.execute(
+            "INSERT OR IGNORE INTO merge_blacklist (uuid_a, uuid_b, reason, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (a, b, reason, _now_iso()),
+        )
+        c.commit()
+    finally:
+        c.close()
+
+
+def merge_documents(keep_uuid: str, drop_uuid: str) -> dict:
+    """Reassign products/contacts/document_tags/notes FK to keep_doc, delete drop_doc.
+
+    Returns {moved_products, moved_contacts, moved_tags, moved_notes, dropped_id}.
+    Atomic single-transaction.
+    """
+    c = _conn()
+    try:
+        keep_row = c.execute(
+            "SELECT id FROM documents WHERE uuid = ?", (keep_uuid,)
+        ).fetchone()
+        drop_row = c.execute(
+            "SELECT id FROM documents WHERE uuid = ?", (drop_uuid,)
+        ).fetchone()
+        if not keep_row or not drop_row:
+            raise ValueError("keep or drop document not found")
+        keep_id = keep_row["id"]
+        drop_id = drop_row["id"]
+        if keep_id == drop_id:
+            raise ValueError("cannot merge document into itself")
+
+        moved_p = c.execute(
+            "UPDATE products SET document_uuid = ?, document_id = ? WHERE document_id = ?",
+            (keep_uuid, keep_id, drop_id),
+        ).rowcount
+        moved_ct = c.execute(
+            "UPDATE contacts SET document_uuid = ?, document_id = ? WHERE document_id = ?",
+            (keep_uuid, keep_id, drop_id),
+        ).rowcount
+        moved_tags = 0
+        moved_notes = 0
+        try:
+            moved_tags = c.execute(
+                "UPDATE document_tags SET document_uuid = ? WHERE document_uuid = ?",
+                (keep_uuid, drop_uuid),
+            ).rowcount
+        except Exception:
+            pass
+        try:
+            moved_notes = c.execute(
+                "UPDATE notes SET document_uuid = ? WHERE document_uuid = ?",
+                (keep_uuid, drop_uuid),
+            ).rowcount
+        except Exception:
+            pass
+
+        c.execute("DELETE FROM documents WHERE id = ?", (drop_id,))
+        c.commit()
+        return {
+            "moved_products": moved_p, "moved_contacts": moved_ct,
+            "moved_tags": moved_tags, "moved_notes": moved_notes,
+            "dropped_id": drop_id,
+        }
+    finally:
+        c.close()
 
 
 def _migrate_auth_tables(c):
@@ -893,9 +1568,10 @@ def insert_extraction(folder: str, record: dict, owner_uuid: str = None, is_shar
          lens_model, focal_length, f_number, iso, exposure_time, software, sub_sec_time,
          client_timezone, client_user_agent, client_ip, client_timestamp,
          image_phash, blur_score, is_blurry, near_dup_of, device_signals,
-         updated_at, edit_count, trade_show)
+         updated_at, edit_count, trade_show,
+         quality_score, needs_revision)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         folder,
         record.get("source_file", ""),
@@ -919,6 +1595,7 @@ def insert_extraction(folder: str, record: dict, owner_uuid: str = None, is_shar
         client_timezone, client_user_agent, client_ip, client_timestamp,
         image_phash, blur_score, is_blurry_v, near_dup_of, device_signals,
         _now, 0, trade_show,
+        record.get("quality_score"), int(bool(record.get("needs_revision"))),
     ))
     doc_id = c.execute("SELECT id FROM documents WHERE folder = ? AND source_file = ?",
                        (folder, record.get("source_file", ""))).fetchone()
@@ -974,7 +1651,21 @@ def insert_extraction(folder: str, record: dict, owner_uuid: str = None, is_shar
         except Exception:
             contact = {}
     if isinstance(contact, dict):
-        ct_company = contact.get("company", "") or ""
+        # Cascade: contact.company → doc.company → first product.company →
+        # website-domain → email-domain. Stops at first non-empty.
+        try:
+            from pipeline.company_resolver import resolve_company  # noqa: WPS433
+            ct_company = resolve_company(
+                contact=contact,
+                doc_company=record.get("company") or "",
+                products=products if isinstance(products, list) else [],
+                website=(contact.get("website") or "").strip(),
+                email=(contact.get("email") or "").strip(),
+            )
+        except Exception:
+            ct_company = (contact.get("company") or record.get("company") or "").strip()
+        if ct_company:
+            contact["company"] = ct_company
         ct_person = contact.get("person", "") or ""
         ct_phone = contact.get("phone", "") or ""
         ct_email = contact.get("email", "") or ""

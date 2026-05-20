@@ -5,6 +5,7 @@
 
   let me = $state<any>(null);
   let loading = $state(true);
+  let stats = $state<{ uploads: number; documents: number; contacts: number; products: number; last_actions: any[] } | null>(null);
 
   let currentPw = $state('');
   let newPw = $state('');
@@ -24,6 +25,11 @@
       } else if (r.status === 401) {
         goto('/login');
       }
+      // Load my stats (best-effort)
+      try {
+        const s = await fetch('/api/me/stats', { credentials: 'include' });
+        if (s.ok) stats = await s.json();
+      } catch {}
     } finally {
       loading = false;
     }
@@ -109,6 +115,26 @@
         </div>
       </div>
     </section>
+
+    {#if stats}
+    <section class="card">
+      <h2 class="section-h">Your activity</h2>
+      <div class="stat-grid">
+        <div class="stat"><div class="stat-num">{stats.documents ?? 0}</div><div class="stat-lbl">Documents</div></div>
+        <div class="stat"><div class="stat-num">{stats.products ?? 0}</div><div class="stat-lbl">Products</div></div>
+        <div class="stat"><div class="stat-num">{stats.contacts ?? 0}</div><div class="stat-lbl">Contacts</div></div>
+        <div class="stat"><div class="stat-num">{stats.uploads ?? 0}</div><div class="stat-lbl">Upload batches</div></div>
+      </div>
+      {#if stats.last_actions && stats.last_actions.length}
+        <h3 class="sub-h">Recent activity</h3>
+        <ul class="action-list">
+          {#each stats.last_actions as a}
+            <li><span class="al-type">{a.event_type}</span> <span class="al-time">{fmtDate(a.ts)}</span></li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
+    {/if}
 
     <section class="card">
       <h2 class="section-h">Change password</h2>
@@ -253,6 +279,15 @@
     font-weight: 600;
     margin: 0 0 14px;
   }
+  .sub-h { font-size: 11px; text-transform: uppercase; color: var(--text-muted); margin: 16px 0 6px; font-weight: 600; letter-spacing: 0.05em; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
+  .stat { padding: 12px; border: 1px solid var(--border); border-radius: var(--r-sm); text-align: center; background: var(--surface-2, var(--surface)); }
+  .stat-num { font-size: 24px; font-weight: 700; color: var(--accent, #c96442); }
+  .stat-lbl { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 4px; }
+  .action-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
+  .action-list li { display: flex; justify-content: space-between; padding: 4px 8px; border-bottom: 1px dashed var(--border); font-size: 12px; }
+  .al-type { font-family: var(--font-mono); }
+  .al-time { color: var(--text-muted); }
 
   .field { display: block; margin-bottom: 12px; }
   .field > span {

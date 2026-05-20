@@ -155,7 +155,20 @@ async def _call_vision(client, img_b64: str, system: str, user_text: str, sem) -
             try:
                 r = await client.post(config.OPENROUTER_BASE, json=payload, headers=HEADERS, timeout=120)
                 r.raise_for_status()
-                return _parse_json(r.json()["choices"][0]["message"]["content"])
+                body = r.json()
+                try:
+                    import database as _db
+                    usage = body.get("usage") or {}
+                    _db.log_llm_usage(
+                        user_uuid=None,  # batch context; owner attribution downstream
+                        op="extract",
+                        model=config.VISION_MODEL,
+                        prompt_tokens=usage.get("prompt_tokens", 0),
+                        completion_tokens=usage.get("completion_tokens", 0),
+                    )
+                except Exception:
+                    pass
+                return _parse_json(body["choices"][0]["message"]["content"])
             except Exception as e:
                 if attempt == 2:
                     raise
@@ -219,8 +232,6 @@ async def extract_one(client: httpx.AsyncClient, img: dict, sem: asyncio.Semapho
 
     # Propagate loader-side EXIF/quality metadata into the result so downstream
     # write-path (insert_extraction → flat columns) can read gps_lat, camera_*, etc.
-    # The LLM may also produce a 'metadata' field; loader metadata takes precedence
-    # for technical fields, LLM fields are kept for anything not in loader meta.
     if isinstance(meta, dict):
         existing_meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         merged = dict(existing_meta)
@@ -229,7 +240,53 @@ async def extract_one(client: httpx.AsyncClient, img: dict, sem: asyncio.Semapho
                 merged[k] = v
         data["metadata"] = merged
 
+    data["quality_score"] = _quality_score(data)
+    data["needs_revision"] = data["quality_score"] < 0.5
     return data
+
+
+_EXPECTED_FIELDS = {
+    "product_page":     ["company", "title", "products"],
+    "company_profile":  ["company", "title", "profile"],
+    "cover":            ["company", "title"],
+    "contact_page":     ["company", "contact"],
+    "qr_card":          ["contact"],
+    "tech_diagram":     ["title", "systems"],
+    "section_divider":  ["title"],
+    "price_list":       ["title", "items"],
+    "other":            ["title"],
+}
+
+
+def _quality_score(data: dict) -> float:
+    """0-1 confidence × completeness × structure heuristic."""
+    if data.get("skipped_reason"):
+        return 0.0
+    conf = float(data.get("classifier_confidence") or 0)
+    img_type = data.get("image_type", "other")
+    fields = _EXPECTED_FIELDS.get(img_type, ["title"])
+
+    filled = 0
+    for f in fields:
+        v = data.get(f)
+        if v is None or v == "" or v == [] or v == {}:
+            continue
+        filled += 1
+    completeness = filled / max(len(fields), 1)
+
+    # Contact bonus: any messenger/QR raises score
+    contact = data.get("contact") or {}
+    if isinstance(contact, dict):
+        ct_filled = sum(1 for k in ("person", "phone", "email", "website") if contact.get(k))
+        contact_bonus = min(ct_filled * 0.05, 0.20)
+    else:
+        contact_bonus = 0.0
+
+    raw = (data.get("raw_text") or "")
+    text_bonus = 0.10 if len(raw) > 30 else 0.0
+
+    score = min(1.0, (conf * 0.40) + (completeness * 0.40) + contact_bonus + text_bonus)
+    return round(score, 3)
 
 
 async def extract_batch(images: list, on_progress=None) -> list:

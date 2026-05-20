@@ -122,9 +122,10 @@
                     title={doc.title || doc.source_file}
                   >
                     <img
-                      src={`/api/image/${doc.folder}/${doc.source_file}`}
+                      src={`/api/thumb/${doc.folder}/${doc.source_file}?w=256`}
                       alt={doc.source_file}
                       loading="lazy"
+                      decoding="async"
                       onerror={(e) => (e.currentTarget as HTMLImageElement).style.opacity = '0.2'}
                     />
                     {#if doc.company}<span class="thumb-tag">{doc.company}</span>{/if}

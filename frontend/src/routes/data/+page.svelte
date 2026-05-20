@@ -23,6 +23,9 @@
   import Tags from '$lib/components/Tags.svelte';
   import Notes from '$lib/components/Notes.svelte';
   import Meetings from '$lib/components/Meetings.svelte';
+  import MergeProposals from '$lib/components/MergeProposals.svelte';
+  import MergeClusters from '$lib/components/MergeClusters.svelte';
+  import AuditLog from '$lib/components/AuditLog.svelte';
 
   const API = '';
 
@@ -30,7 +33,7 @@
   const SECTION_TABS = {
     catalog: ['cards','contacts','products','companies','categories','specs','gallery'],
     insights: ['locations','timeline','countries','messengers','qr','quality','duplicates','sync','cameras','pricing'],
-    workspace: ['tags','notes','meetings']
+    workspace: ['tags','notes','meetings','merges','audit']
   };
   const SECTIONS = ['catalog','insights','workspace'];
   const SECTION_LABELS = { catalog: 'Catalog', insights: 'Insights', workspace: 'Workspace' };
@@ -44,7 +47,8 @@
     locations: '📍 Locations', timeline: '🗓 Timeline', countries: '🌍 Countries',
     messengers: '💬 Messengers', qr: '🔗 QR', quality: '⚠ Quality',
     duplicates: '🔁 Duplicates', sync: '📨 Sources', cameras: '📷 Cameras',
-    pricing: '💰 Pricing', tags: '🏷 Tags', notes: '📝 Notes', meetings: '🤝 Meetings'
+    pricing: '💰 Pricing', tags: '🏷 Tags', notes: '📝 Notes', meetings: '🤝 Meetings',
+    merges: '🔀 Pending Merges', audit: '📜 Audit Log'
   };
   let activeTab = $state('cards');
   let activeSection = $state('catalog');
@@ -516,10 +520,11 @@
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
                 <img
-                  src={`/api/image/${doc.folder}/${doc.source_file}`}
+                  src={`/api/thumb/${doc.folder}/${doc.source_file}?w=256`}
                   alt={doc.source_file}
                   class="card-thumb clickable"
                   loading="lazy"
+                  decoding="async"
                   onclick={(e) => openImageLightbox(doc, e)}
                   onerror={(e) => e.target.style.display='none'}
                 />
@@ -731,6 +736,10 @@
     <Notes />
   {:else if activeTab === 'meetings'}
     <Meetings />
+  {:else if activeTab === 'merges'}
+    <MergeClusters />
+  {:else if activeTab === 'audit'}
+    <AuditLog />
   {/if}
 </div>
 

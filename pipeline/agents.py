@@ -67,6 +67,7 @@ Return JSON:
   "company": "company name",
   "title": "page title",
   "contact": {
+    "company": "company name (same as top-level company)",
     "person": "contact person name or null",
     "phone": "phone number(s)",
     "email": "email address(es)",
@@ -122,6 +123,7 @@ Return JSON:
   "company": "company name or null",
   "title": "card/page title or null",
   "contact": {
+    "company": "company name printed on the card (same as top-level company) or null",
     "person": "name printed on the card or null",
     "phone": "primary phone number or null",
     "email": "email or null",

@@ -381,12 +381,41 @@ async def upload_images(request: Request, files: list[UploadFile] = File(...), b
         name = name.replace("\x00", "").replace("..", "_")
         return name[:200] or "upload"
 
+    force_reupload = (form.get("force") or "").strip().lower() in ("1", "true", "yes")
+
+    def _recent_same_filename(owner_uuid: str, fname: str) -> str | None:
+        """Return existing batch_id if same (owner, filename) ingested in last 24h."""
+        try:
+            c = db._conn()
+            try:
+                row = c.execute(
+                    "SELECT folder FROM documents "
+                    "WHERE owner_uuid = ? AND source_file = ? "
+                    "AND created_at >= datetime('now', '-1 day') "
+                    "ORDER BY id DESC LIMIT 1",
+                    (owner_uuid, fname),
+                ).fetchone()
+                return row["folder"] if row else None
+            finally:
+                c.close()
+        except Exception:
+            return None
+
     queued = []
     skipped = []
     pdf_jobs: list = []
     for f in files:
         safe_name = _safe_filename(f.filename)
         ext = os.path.splitext(safe_name)[1].lower()
+        if not force_reupload:
+            dup_batch = _recent_same_filename(user["uuid"], safe_name)
+            if dup_batch:
+                skipped.append({
+                    "name": safe_name,
+                    "reason": f"duplicate filename in last 24h (batch {dup_batch}); pass force=1 to override",
+                    "existing_batch_id": dup_batch,
+                })
+                continue
         if ext not in SUPPORTED:
             print(f"[upload] skip {safe_name!r}: ext {ext!r} not in SUPPORTED")
             skipped.append({"name": safe_name, "reason": f"unsupported extension {ext}"})
@@ -1533,6 +1562,92 @@ def _safe_under(base_dir: str, candidate: str) -> bool:
         return False
 
 
+@app.get("/api/thumb/{folder}/{filename:path}")
+async def serve_thumb(folder: str, filename: str, w: int = 256, user=Depends(current_user)):
+    """Serve cached resized thumbnail (default 256px wide).
+
+    Generates once into <UPLOADS_DIR>/<folder>/.thumbs/<w>_<filename>.jpg, then
+    serves cached. ~50KB instead of full 1MB original; speeds up grid views 10×+.
+    """
+    from fastapi.responses import FileResponse
+    if '..' in folder or '..' in filename or folder.startswith('/') or filename.startswith('/'):
+        raise HTTPException(400, "Invalid path")
+    if '\x00' in folder or '\x00' in filename:
+        raise HTTPException(400, "Invalid path")
+    w = max(64, min(int(w or 256), 1024))
+
+    is_admin = user.get("role") in ("super_admin", "admin")
+    try:
+        c = db._conn()
+        try:
+            if is_admin:
+                row = c.execute(
+                    "SELECT 1 FROM documents WHERE folder = ? AND source_file = ? "
+                    "UNION ALL SELECT 1 FROM queue WHERE batch_id = ? AND file_name = ? LIMIT 1",
+                    (folder, filename, folder, filename),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT 1 FROM documents WHERE folder = ? AND source_file = ? AND owner_uuid = ? "
+                    "UNION ALL SELECT 1 FROM queue WHERE batch_id = ? AND file_name = ? AND owner_uuid = ? LIMIT 1",
+                    (folder, filename, user["uuid"], folder, filename, user["uuid"]),
+                ).fetchone()
+        finally:
+            c.close()
+        if not row:
+            raise HTTPException(404, "not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Thumb auth check error: {e}")
+        raise HTTPException(500, "auth check failed")
+
+    # Resolve original local path (S3 → download to local cache first)
+    orig = os.path.join(config.UPLOADS_DIR, folder, filename)
+    if not _safe_under(config.UPLOADS_DIR, orig):
+        raise HTTPException(403, "outside uploads")
+    if not os.path.isfile(orig):
+        # Try S3 → local cache path
+        try:
+            local_path = storage.get_local_path(upload_key(folder, filename))
+            if local_path and os.path.isfile(local_path):
+                orig = local_path
+            else:
+                raise HTTPException(404, "original missing")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(404, "original missing")
+
+    thumb_dir = os.path.join(config.UPLOADS_DIR, folder, ".thumbs")
+    safe_fname = filename.replace("/", "_")
+    thumb_path = os.path.join(thumb_dir, f"{w}_{safe_fname}.jpg")
+
+    # Regenerate if source newer than thumb
+    needs_gen = (
+        not os.path.isfile(thumb_path)
+        or os.path.getmtime(thumb_path) < os.path.getmtime(orig)
+    )
+    if needs_gen:
+        try:
+            from PIL import Image as _PILImage
+            os.makedirs(thumb_dir, exist_ok=True)
+            with _PILImage.open(orig) as im:
+                im = im.convert("RGB")
+                im.thumbnail((w, w * 4), _PILImage.LANCZOS)
+                im.save(thumb_path, "JPEG", quality=82, optimize=True)
+        except Exception as e:
+            print(f"Thumb gen failed for {orig}: {e}")
+            # Fall back to serving original
+            return FileResponse(orig, headers={"Cache-Control": "private, max-age=3600"})
+
+    return FileResponse(
+        thumb_path,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=604800"},  # 7 days
+    )
+
+
 @app.get("/api/image/{folder}/{filename:path}")
 async def serve_image(folder: str, filename: str, user=Depends(current_user)):
     from fastapi.responses import FileResponse, RedirectResponse
@@ -2110,13 +2225,128 @@ def _start_vector_pruner():
             n = vs.prune_orphans(folders)
             if n:
                 print(f"[vs] pruned {n} orphan vectors")
+            return {"pruned": n}
         except Exception as e:
             print(f"[vs] prune error: {e}")
+            return {"error": str(e)}
+
+    def _nightly_backfill_cheap():
+        try:
+            import asyncio as _asyncio
+            from pipeline.backfill import backfill_company
+            res = _asyncio.run(backfill_company(limit=2000, cheap_only=True))
+            print(f"[backfill] nightly cheap: {res}")
+            return res
+        except Exception as e:
+            print(f"[backfill] cheap error: {e}")
+            return {"error": str(e)}
+
+    def _nightly_trade_show_summaries():
+        """Detect trade shows that ended (no upload last 3d) and not yet summarized."""
+        try:
+            c = db._conn()
+            try:
+                rows = c.execute(
+                    """
+                    SELECT trade_show, MAX(created_at) AS last_upload
+                    FROM documents
+                    WHERE trade_show IS NOT NULL AND TRIM(trade_show) != ''
+                    GROUP BY trade_show
+                    HAVING MAX(created_at) < datetime('now', '-3 day')
+                       AND MAX(created_at) > datetime('now', '-14 day')
+                    """
+                ).fetchall()
+                shows = [r["trade_show"] for r in rows]
+            finally:
+                c.close()
+            for show in shows:
+                # Skip if already summarized
+                c2 = db._conn()
+                try:
+                    done = c2.execute(
+                        "SELECT 1 FROM events WHERE event_type = 'trade_show_summary_ready' "
+                        "AND entity_uuid = ? LIMIT 1",
+                        (show,),
+                    ).fetchone()
+                finally:
+                    c2.close()
+                if done:
+                    continue
+                summary = db.trade_show_summary(show)
+                db.log_event_safe(
+                    "trade_show_summary_ready", "trade_show", show, None,
+                    detail=summary,
+                )
+                print(f"[ts-summary] generated for {show}")
+            return {"summarized": shows}
+        except Exception as e:
+            print(f"[ts-summary] error: {e}")
+            return {"error": str(e)}
+
+    def _nightly_dedup_scan():
+        try:
+            from pipeline.dedup import scan_all
+            res = scan_all()
+            print(f"[dedup] nightly scan: {res}")
+            return res
+        except Exception as e:
+            print(f"[dedup] scan error: {e}")
+            return {"error": str(e)}
+
+    def _nightly_backfill_llm():
+        try:
+            import asyncio as _asyncio
+            from pipeline.backfill import backfill_company_llm
+            res = _asyncio.run(backfill_company_llm(limit=50))
+            print(f"[backfill] nightly LLM: {res}")
+            return res
+        except Exception as e:
+            print(f"[backfill] llm error: {e}")
+            return {"error": str(e)}
+
+    # Make jobs reachable by /api/admin/jobs/run/<id>
+    _JOB_REGISTRY["vs_prune"] = _prune
+    _JOB_REGISTRY["backfill_cheap"] = _nightly_backfill_cheap
+    _JOB_REGISTRY["backfill_llm"] = _nightly_backfill_llm
+    _JOB_REGISTRY["dedup_scan"] = _nightly_dedup_scan
+    _JOB_REGISTRY["ts_summary"] = _nightly_trade_show_summaries
 
     sched = BackgroundScheduler()
-    sched.add_job(_prune, "interval", hours=24, id="vs_prune")
+    globals()["_SCHED"] = sched
+    _apply_cron_config(sched)
     sched.start()
-    print("[vs] vector pruner scheduled every 24h")
+    print(f"[sched] registered jobs: {list(_JOB_REGISTRY.keys())}")
+
+
+def _apply_cron_config(sched=None):
+    """(Re)build APScheduler jobs from db.cron_config. Reuses _JOB_REGISTRY fns."""
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
+    sched = sched or globals().get("_SCHED")
+    if not sched or not _JOB_REGISTRY:
+        return
+    cfg_rows = db.cron_config_list()
+    for row in cfg_rows:
+        jid = row["job_id"]
+        fn = _JOB_REGISTRY.get(jid)
+        if not fn:
+            continue
+        # Remove existing
+        try:
+            sched.remove_job(jid)
+        except Exception:
+            pass
+        if not row.get("enabled"):
+            continue
+        if row.get("interval_hours"):
+            sched.add_job(fn, IntervalTrigger(hours=int(row["interval_hours"])), id=jid)
+        else:
+            hour = row.get("cron_hour")
+            minute = row.get("cron_minute") or 0
+            if hour is None:
+                continue
+            sched.add_job(fn, CronTrigger(hour=int(hour), minute=int(minute)), id=jid)
+    print(f"[sched] applied config: {[r['job_id'] for r in cfg_rows if r.get('enabled')]}")
 
 
 # ─── AGGREGATIONS ───
@@ -2684,6 +2914,389 @@ def events_list(limit: int = 100, user: Optional[str] = None, type: Optional[str
                 requester=Depends(current_user)):
     with db.db() as c:
         return db.list_events(c, limit=limit, user_uuid=user, event_type=type, requester=requester)
+
+
+# ─── ADMIN: manually run scheduled jobs ────────────────────────────────────
+_JOB_REGISTRY: dict = {}  # populated at startup by _start_vector_pruner
+
+
+@app.post("/api/admin/jobs/run/{job_id}")
+async def admin_run_job(job_id: str, user=Depends(current_user)):
+    """Trigger any nightly cron job on-demand. Super-admin only."""
+    if (user or {}).get("role") != "super_admin":
+        raise HTTPException(403, "super_admin only")
+    fn = _JOB_REGISTRY.get(job_id)
+    if not fn:
+        raise HTTPException(404, f"unknown job '{job_id}'. available: {list(_JOB_REGISTRY)}")
+    import time, inspect, asyncio as _asyncio
+    t0 = time.time()
+    try:
+        if inspect.iscoroutinefunction(fn):
+            result = await fn()
+        else:
+            result = await _asyncio.to_thread(fn)
+    except Exception as e:
+        raise HTTPException(500, f"job '{job_id}' failed: {e}")
+    elapsed = round(time.time() - t0, 2)
+    db.log_event_safe(
+        "admin_job_run", "job", job_id, user["uuid"],
+        detail={"elapsed_sec": elapsed, "result": result},
+    )
+    return {"job_id": job_id, "elapsed_sec": elapsed, "result": result, "ok": True}
+
+
+@app.get("/api/admin/jobs/schedule")
+def admin_job_schedule(user=Depends(current_user)):
+    """List current cron schedule for all jobs. Super-admin only."""
+    if (user or {}).get("role") != "super_admin":
+        raise HTTPException(403, "super_admin only")
+    return {
+        "jobs": [
+            {**row, "label": _JOB_LABELS.get(row["job_id"], row["job_id"])}
+            for row in db.cron_config_list()
+        ]
+    }
+
+
+@app.patch("/api/admin/jobs/schedule/{job_id}")
+def admin_job_schedule_update(job_id: str, payload: dict = None, user=Depends(current_user)):
+    """Update a job's schedule. Super-admin only.
+
+    Body: {cron_hour: 0-23, cron_minute: 0-59, interval_hours: int, enabled: bool}
+    Pass cron_hour as null to use interval_hours instead.
+    """
+    if (user or {}).get("role") != "super_admin":
+        raise HTTPException(403, "super_admin only")
+    payload = payload or {}
+    if job_id not in _JOB_REGISTRY:
+        raise HTTPException(404, f"unknown job '{job_id}'")
+    try:
+        updated = db.cron_config_update(
+            job_id,
+            cron_hour=payload.get("cron_hour"),
+            cron_minute=payload.get("cron_minute"),
+            interval_hours=payload.get("interval_hours"),
+            enabled=payload.get("enabled"),
+            updated_by=user["uuid"],
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # Reapply schedule live
+    _apply_cron_config()
+    db.log_event_safe(
+        "cron_schedule_changed", "job", job_id, user["uuid"],
+        detail={"new_config": updated},
+    )
+    return updated
+
+
+@app.get("/api/admin/jobs")
+def admin_list_jobs(user=Depends(current_user)):
+    """Super-admin only. List jobs available for on-demand run."""
+    if (user or {}).get("role") != "super_admin":
+        raise HTTPException(403, "super_admin only")
+    return {
+        "jobs": [
+            {"id": jid, "label": _JOB_LABELS.get(jid, jid)}
+            for jid in _JOB_REGISTRY
+        ]
+    }
+
+
+_JOB_LABELS = {
+    "vs_prune": "Prune orphan ChromaDB vectors",
+    "backfill_cheap": "Backfill missing company (cheap cascade)",
+    "backfill_llm": "Backfill missing company (LLM re-vision)",
+    "dedup_scan": "Scan for duplicate contacts + documents",
+    "ts_summary": "Generate trade-show summaries",
+}
+
+
+@app.get("/api/trade-shows/{trade_show}/summary")
+def get_trade_show_summary(trade_show: str, user=Depends(current_user)):
+    is_admin = user.get("role") in ("super_admin", "admin")
+    return db.trade_show_summary(trade_show, user_uuid=None if is_admin else user["uuid"])
+
+
+@app.get("/api/admin/llm-cost")
+def admin_llm_cost(days: int = 30, user_uuid: str = None, user=Depends(current_user)):
+    _require_admin(user)
+    return db.llm_cost_summary(days=days, user_uuid=user_uuid)
+
+
+@app.get("/api/admin/usage-heatmap")
+def admin_usage_heatmap(days: int = 14, user_uuid: str = None, user=Depends(current_user)):
+    _require_admin(user)
+    return db.usage_heatmap(days=days, user_uuid=user_uuid)
+
+
+@app.get("/api/admin/funnel")
+def admin_funnel(days: int = 30, user_uuid: str = None, user=Depends(current_user)):
+    _require_admin(user)
+    return db.conversion_funnel(days=days, user_uuid=user_uuid)
+
+
+@app.get("/api/me/stats")
+def my_stats(user=Depends(current_user)):
+    """Per-user upload/doc counts + last 5 events. Self-only."""
+    user_uuid = user["uuid"]
+    is_admin = user.get("role") in ("super_admin", "admin")
+    c = db._conn()
+    try:
+        if is_admin:
+            docs = c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+            prods = c.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+            cts = c.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+            uploads = c.execute("SELECT COUNT(DISTINCT folder) FROM documents").fetchone()[0]
+        else:
+            docs = c.execute(
+                "SELECT COUNT(*) FROM documents WHERE owner_uuid = ?", (user_uuid,)
+            ).fetchone()[0]
+            prods = c.execute(
+                "SELECT COUNT(*) FROM products WHERE owner_uuid = ?", (user_uuid,)
+            ).fetchone()[0]
+            cts = c.execute(
+                "SELECT COUNT(*) FROM contacts WHERE owner_uuid = ?", (user_uuid,)
+            ).fetchone()[0]
+            uploads = c.execute(
+                "SELECT COUNT(DISTINCT folder) FROM documents WHERE owner_uuid = ?",
+                (user_uuid,),
+            ).fetchone()[0]
+        actions = c.execute(
+            "SELECT event_type, entity_type, entity_uuid, ts, detail_json AS detail "
+            "FROM events WHERE user_uuid = ? ORDER BY id DESC LIMIT 5",
+            (user_uuid,),
+        ).fetchall()
+    finally:
+        c.close()
+    return {
+        "documents": docs,
+        "products": prods,
+        "contacts": cts,
+        "uploads": uploads,
+        "last_actions": [dict(r) for r in actions],
+    }
+
+
+# ─── BACKFILL + DEDUP + MERGE APPROVAL ENDPOINTS ───
+
+def _require_admin(user):
+    role = (user or {}).get("role")
+    if role not in ("super_admin", "admin"):
+        raise HTTPException(403, "admin required")
+
+
+@app.post("/api/admin/backfill/company")
+async def admin_backfill_company(payload: dict = None, user=Depends(current_user)):
+    _require_admin(user)
+    payload = payload or {}
+    from pipeline.backfill import backfill_company
+    return await backfill_company(
+        limit=int(payload.get("limit", 2000)),
+        cheap_only=bool(payload.get("cheap_only", True)),
+        dry_run=bool(payload.get("dry_run", False)),
+    )
+
+
+@app.post("/api/admin/backfill/company/llm")
+async def admin_backfill_company_llm(payload: dict = None, user=Depends(current_user)):
+    _require_admin(user)
+    payload = payload or {}
+    from pipeline.backfill import backfill_company_llm
+    return await backfill_company_llm(limit=int(payload.get("limit", 50)))
+
+
+@app.post("/api/merge/scan")
+def admin_merge_scan(user=Depends(current_user)):
+    _require_admin(user)
+    from pipeline.dedup import scan_all
+    return scan_all()
+
+
+@app.get("/api/merge/clusters")
+def list_merge_clusters(
+    status: str = "pending",
+    entity: str | None = None,
+    min_confidence: float = 0.0,
+    limit: int = 100,
+    user=Depends(current_user),
+):
+    """Grouped view: one cluster per (keep_uuid, match_reason). Includes keep preview + all drops."""
+    _require_admin(user)
+    return db.merge_proposal_clusters(
+        status=status, entity_type=entity,
+        min_confidence=min_confidence, limit=limit,
+    )
+
+
+@app.post("/api/merge/clusters/approve")
+def approve_cluster(payload: dict = None, user=Depends(current_user)):
+    """Approve all proposals in a cluster (keep_uuid + match_reason)."""
+    _require_admin(user)
+    payload = payload or {}
+    keep_uuid = payload.get("keep_uuid")
+    match_reason = payload.get("match_reason")
+    if not keep_uuid or not match_reason:
+        raise HTTPException(400, "keep_uuid + match_reason required")
+
+    proposals = db.merge_proposal_list(
+        status="pending", entity_type=payload.get("entity_type"), limit=10000,
+    )
+    proposals = [
+        p for p in proposals
+        if p["keep_uuid"] == keep_uuid and p["match_reason"] == match_reason
+    ]
+    if not proposals:
+        return {"approved": 0, "errors": ["cluster empty or already processed"]}
+
+    approved = 0
+    errors: list[str] = []
+    for p in proposals:
+        try:
+            if p["entity_type"] == "contact":
+                db.merge_contacts(p["keep_uuid"], p["drop_uuid"])
+            elif p["entity_type"] == "document":
+                db.merge_documents(p["keep_uuid"], p["drop_uuid"])
+            db.merge_proposal_update_status(p["uuid"], "approved", reviewed_by=user["uuid"])
+            approved += 1
+        except Exception as e:
+            errors.append(f"{p['uuid']}: {e}")
+    db.log_event_safe(
+        "merge_cluster_approved", p["entity_type"], keep_uuid, user["uuid"],
+        detail={"reason": match_reason, "approved": approved, "errors": len(errors)},
+    )
+    return {"approved": approved, "errors": errors[:10], "keep_uuid": keep_uuid}
+
+
+@app.post("/api/merge/clusters/reject")
+def reject_cluster(payload: dict = None, user=Depends(current_user)):
+    """Reject all proposals in a cluster + blacklist pairs."""
+    _require_admin(user)
+    payload = payload or {}
+    keep_uuid = payload.get("keep_uuid")
+    match_reason = payload.get("match_reason")
+    if not keep_uuid or not match_reason:
+        raise HTTPException(400, "keep_uuid + match_reason required")
+
+    proposals = db.merge_proposal_list(
+        status="pending", entity_type=payload.get("entity_type"), limit=10000,
+    )
+    proposals = [
+        p for p in proposals
+        if p["keep_uuid"] == keep_uuid and p["match_reason"] == match_reason
+    ]
+    rejected = 0
+    for p in proposals:
+        db.merge_proposal_update_status(p["uuid"], "rejected", reviewed_by=user["uuid"])
+        db.merge_blacklist_add(p["keep_uuid"], p["drop_uuid"], reason="cluster_rejected")
+        rejected += 1
+    return {"rejected": rejected, "keep_uuid": keep_uuid}
+
+
+@app.get("/api/merge/proposals")
+def list_merge_proposals(
+    status: str = "pending",
+    entity: str | None = None,
+    min_confidence: float = 0.0,
+    limit: int = 500,
+    user=Depends(current_user),
+):
+    _require_admin(user)
+    return db.merge_proposal_list(
+        status=status, entity_type=entity,
+        min_confidence=min_confidence, limit=limit,
+    )
+
+
+@app.post("/api/merge/proposals/{proposal_uuid}/approve")
+def approve_merge_proposal(proposal_uuid: str, user=Depends(current_user)):
+    _require_admin(user)
+    prop = db.merge_proposal_get(proposal_uuid)
+    if not prop:
+        raise HTTPException(404, "proposal not found")
+    if prop["status"] != "pending":
+        raise HTTPException(409, f"proposal status is {prop['status']}")
+
+    entity = prop["entity_type"]
+    keep = prop["keep_uuid"]
+    drop = prop["drop_uuid"]
+
+    try:
+        if entity == "contact":
+            result = db.merge_contacts(keep, drop)
+            after_snap = {"merge_result": result}
+        elif entity == "document":
+            result = db.merge_documents(keep, drop)
+            after_snap = {"merge_result": result}
+        else:
+            raise HTTPException(400, f"unknown entity_type {entity}")
+    except Exception as e:
+        raise HTTPException(500, f"merge failed: {e}")
+
+    db.merge_proposal_update_status(
+        proposal_uuid, "approved",
+        reviewed_by=user["uuid"], after_snapshot=after_snap,
+    )
+    db.log_event_safe(
+        "merge_approved", entity, keep, user["uuid"],
+        detail={"proposal_uuid": proposal_uuid, "drop_uuid": drop, "result": after_snap},
+    )
+    return {"ok": True, "result": after_snap}
+
+
+@app.post("/api/merge/proposals/{proposal_uuid}/reject")
+def reject_merge_proposal(proposal_uuid: str, user=Depends(current_user)):
+    _require_admin(user)
+    prop = db.merge_proposal_get(proposal_uuid)
+    if not prop:
+        raise HTTPException(404, "proposal not found")
+    if prop["status"] != "pending":
+        raise HTTPException(409, f"proposal status is {prop['status']}")
+    db.merge_proposal_update_status(proposal_uuid, "rejected", reviewed_by=user["uuid"])
+    db.merge_blacklist_add(prop["keep_uuid"], prop["drop_uuid"], reason="rejected")
+    return {"ok": True}
+
+
+@app.post("/api/merge/proposals/{proposal_uuid}/swap")
+def swap_merge_proposal(proposal_uuid: str, user=Depends(current_user)):
+    _require_admin(user)
+    prop = db.merge_proposal_get(proposal_uuid)
+    if not prop or prop["status"] != "pending":
+        raise HTTPException(409, "not pending or not found")
+    c = db._conn()
+    try:
+        c.execute(
+            "UPDATE merge_proposals SET keep_uuid = ?, drop_uuid = ? WHERE uuid = ?",
+            (prop["drop_uuid"], prop["keep_uuid"], proposal_uuid),
+        )
+        c.commit()
+    finally:
+        c.close()
+    return {"ok": True}
+
+
+@app.post("/api/merge/proposals/bulk-approve")
+def bulk_approve(payload: dict = None, user=Depends(current_user)):
+    _require_admin(user)
+    payload = payload or {}
+    min_conf = float(payload.get("min_confidence", 0.95))
+    entity = payload.get("entity")
+    proposals = db.merge_proposal_list(
+        status="pending", entity_type=entity, min_confidence=min_conf, limit=1000,
+    )
+    approved = 0
+    errors: list[str] = []
+    for p in proposals:
+        try:
+            if p["entity_type"] == "contact":
+                db.merge_contacts(p["keep_uuid"], p["drop_uuid"])
+            elif p["entity_type"] == "document":
+                db.merge_documents(p["keep_uuid"], p["drop_uuid"])
+            db.merge_proposal_update_status(p["uuid"], "approved", reviewed_by=user["uuid"])
+            approved += 1
+        except Exception as e:
+            errors.append(f"{p['uuid']}: {e}")
+    return {"approved": approved, "errors": errors[:20]}
 
 
 # Serve frontend — static assets + SPA fallback

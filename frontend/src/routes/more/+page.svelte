@@ -2,6 +2,9 @@
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
+  import { auth } from '$lib/auth.svelte';
+  import AdminInsights from '$lib/components/AdminInsights.svelte';
+  import UsersManager from '$lib/components/UsersManager.svelte';
 
   const API = '';
 
@@ -18,10 +21,14 @@
 
   // Tabs — only Tools and Stats remain; tables now live on /data
   let activeTab = $state('tools');
-  const tabs = [
+  let tabs = $derived([
     { id: 'tools', label: 'Tools' },
-    { id: 'stats', label: 'Stats' }
-  ];
+    { id: 'stats', label: 'Stats' },
+    ...(auth.isAdmin ? [
+      { id: 'users', label: '👥 Users' },
+      { id: 'admin', label: '⚙ Admin Insights' },
+    ] : []),
+  ]);
 
   onMount(async () => {
     try {
@@ -69,12 +76,12 @@
   }
 </script>
 
-<svelte:head><title>More | KONTACT</title></svelte:head>
+<svelte:head><title>Settings | KONTACT</title></svelte:head>
 
 <div class="page">
   <header class="page-head">
-    <h1 class="page-title">More</h1>
-    <p class="page-sub">Settings, search, and exports</p>
+    <h1 class="page-title">Settings</h1>
+    <p class="page-sub">Tools, users, and admin controls</p>
   </header>
 
   <!-- TAB SWITCHER -->
@@ -220,6 +227,16 @@
         <p class="muted">Loading stats...</p>
       {/if}
     </div>
+  {/if}
+
+  <!-- USERS (admin only) -->
+  {#if activeTab === 'users' && auth.isAdmin}
+    <UsersManager />
+  {/if}
+
+  <!-- ADMIN INSIGHTS (admin/super-admin only) -->
+  {#if activeTab === 'admin' && auth.isAdmin}
+    <AdminInsights />
   {/if}
 </div>
 
