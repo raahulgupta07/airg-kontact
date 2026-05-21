@@ -129,6 +129,7 @@ def _add_column(c, table: str, col_def: str):
         pass
 
 
+@serialized_write
 def _migrate_columns(c):
     """Idempotent ALTER TABLE for added columns. Each in its own try/except."""
     contact_cols = [
@@ -357,6 +358,7 @@ def can_edit(row: dict, user: dict) -> bool:
     return bool(row) and row.get("owner_uuid") == user.get("uuid")
 
 
+@serialized_write
 def backfill_ownership(c):
     """One-time backfill: legacy rows get assigned to super_admin and marked shared."""
     try:
@@ -396,6 +398,7 @@ def run_tenancy_backfill():
         c.close()
 
 
+@serialized_write
 def init_db():
     c = _conn()
     c.executescript("""
@@ -604,6 +607,7 @@ def _now_iso():
 
 
 # ── Tags ────────────────────────────────────────────────────────────
+@serialized_write
 def create_tag(c, name: str, color: str = None, user_uuid: str = None) -> str:
     name = (name or "").strip()
     if not name:
@@ -625,6 +629,7 @@ def list_tags(c, user=None):
     return [dict(r) for r in rows]
 
 
+@serialized_write
 def delete_tag(c, tag_uuid: str) -> int:
     n = c.execute("DELETE FROM tags WHERE uuid = ?", (tag_uuid,)).rowcount
     c.execute("DELETE FROM document_tags WHERE tag_uuid = ?", (tag_uuid,))
@@ -637,6 +642,7 @@ def get_tag(c, tag_uuid: str):
     return dict(row) if row else None
 
 
+@serialized_write
 def tag_document(c, doc_uuid: str, tag_uuid: str, user_uuid: str = None) -> int:
     try:
         c.execute(
@@ -649,6 +655,7 @@ def tag_document(c, doc_uuid: str, tag_uuid: str, user_uuid: str = None) -> int:
         return 0
 
 
+@serialized_write
 def untag_document(c, doc_uuid: str, tag_uuid: str) -> int:
     n = c.execute(
         "DELETE FROM document_tags WHERE document_uuid = ? AND tag_uuid = ?",
@@ -669,6 +676,7 @@ def list_doc_tags(c, doc_uuid: str):
 
 
 # ── Notes ───────────────────────────────────────────────────────────
+@serialized_write
 def create_note(c, entity_type: str, entity_uuid: str, body: str, owner_uuid: str) -> str:
     new_uuid = str(uuid4())
     c.execute(
@@ -697,6 +705,7 @@ def get_note(c, note_uuid: str):
     return dict(row) if row else None
 
 
+@serialized_write
 def update_note(c, note_uuid: str, body: str, user_uuid: str) -> int:
     row = c.execute("SELECT owner_uuid FROM notes WHERE uuid = ?", (note_uuid,)).fetchone()
     if not row:
@@ -711,6 +720,7 @@ def update_note(c, note_uuid: str, body: str, user_uuid: str) -> int:
     return n
 
 
+@serialized_write
 def delete_note(c, note_uuid: str, user_uuid: str, is_admin: bool = False) -> int:
     row = c.execute("SELECT owner_uuid FROM notes WHERE uuid = ?", (note_uuid,)).fetchone()
     if not row:
@@ -727,6 +737,7 @@ _MEETING_UPDATABLE = {"contact_uuid", "company", "person", "meeting_date",
                       "location", "city", "notes", "outcome", "is_shared"}
 
 
+@serialized_write
 def create_meeting(c, owner_uuid: str, **fields) -> str:
     new_uuid = str(uuid4())
     contact_uuid = fields.get("contact_uuid")
@@ -772,6 +783,7 @@ def get_meeting(c, meeting_uuid: str):
     return dict(row) if row else None
 
 
+@serialized_write
 def update_meeting(c, meeting_uuid: str, fields: dict, user_uuid: str, is_admin: bool = False) -> int:
     row = c.execute("SELECT owner_uuid FROM meetings WHERE uuid = ?", (meeting_uuid,)).fetchone()
     if not row:
@@ -790,6 +802,7 @@ def update_meeting(c, meeting_uuid: str, fields: dict, user_uuid: str, is_admin:
     return n
 
 
+@serialized_write
 def delete_meeting(c, meeting_uuid: str, user_uuid: str, is_admin: bool = False) -> int:
     row = c.execute("SELECT owner_uuid FROM meetings WHERE uuid = ?", (meeting_uuid,)).fetchone()
     if not row:
@@ -802,6 +815,7 @@ def delete_meeting(c, meeting_uuid: str, user_uuid: str, is_admin: bool = False)
 
 
 # ── Events / audit ──────────────────────────────────────────────────
+@serialized_write
 def log_event(c, event_type: str, entity_type: str = None, entity_uuid: str = None,
               user_uuid: str = None, detail: dict = None):
     """Best-effort audit log insert. Never raise."""
@@ -857,6 +871,7 @@ def cron_config_get(job_id: str) -> dict | None:
         c.close()
 
 
+@serialized_write
 def cron_config_update(job_id: str, *, cron_hour=None, cron_minute=None,
                        interval_hours=None, enabled=None, updated_by: str = None) -> dict:
     c = _conn()
@@ -884,6 +899,7 @@ def cron_config_update(job_id: str, *, cron_hour=None, cron_minute=None,
         c.close()
 
 
+@serialized_write
 def log_llm_usage(user_uuid: str, op: str, model: str,
                   prompt_tokens: int = 0, completion_tokens: int = 0):
     """Best-effort log. Never raises."""
@@ -1128,6 +1144,7 @@ def _migrate_merge_tables(c):
     """)
 
 
+@serialized_write
 def merge_proposal_create(entity_type: str, keep_uuid: str, drop_uuid: str,
                           match_reason: str, confidence: float,
                           before_snapshot: dict,
@@ -1335,6 +1352,7 @@ def merge_proposal_get(proposal_uuid: str) -> dict | None:
         c.close()
 
 
+@serialized_write
 def merge_proposal_update_status(proposal_uuid: str, status: str,
                                  reviewed_by: str | None = None,
                                  after_snapshot: dict | None = None):
@@ -1353,6 +1371,7 @@ def merge_proposal_update_status(proposal_uuid: str, status: str,
         c.close()
 
 
+@serialized_write
 def merge_blacklist_add(uuid_a: str, uuid_b: str, reason: str = "rejected"):
     a, b = sorted([uuid_a, uuid_b])
     c = _conn()
@@ -1367,6 +1386,7 @@ def merge_blacklist_add(uuid_a: str, uuid_b: str, reason: str = "rejected"):
         c.close()
 
 
+@serialized_write
 def merge_documents(keep_uuid: str, drop_uuid: str) -> dict:
     """Reassign products/contacts/document_tags/notes FK to keep_doc, delete drop_doc.
 
@@ -1472,6 +1492,7 @@ def get_user_by_uuid(c, user_uuid: str):
     return c.execute("SELECT * FROM users WHERE uuid = ?", (user_uuid,)).fetchone()
 
 
+@serialized_write
 def create_user(c, name, email, phone_e164, password_hash, pin_hash, role, created_by):
     new_uuid = str(uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -1484,6 +1505,7 @@ def create_user(c, name, email, phone_e164, password_hash, pin_hash, role, creat
     return new_uuid
 
 
+@serialized_write
 def update_user(c, user_uuid: str, updates: dict) -> int:
     fields = {k: v for k, v in (updates or {}).items() if k in _USER_UPDATABLE}
     if not fields:
@@ -1501,6 +1523,7 @@ def list_users(c):
     ).fetchall()
 
 
+@serialized_write
 def delete_user(c, user_uuid: str) -> int:
     row = c.execute("SELECT role FROM users WHERE uuid = ?", (user_uuid,)).fetchone()
     if not row:
@@ -1512,6 +1535,7 @@ def delete_user(c, user_uuid: str) -> int:
     return cur.rowcount
 
 
+@serialized_write
 def touch_login(c, user_uuid: str):
     now = datetime.now(timezone.utc).isoformat()
     c.execute("UPDATE users SET last_login = ? WHERE uuid = ?", (now, user_uuid))
@@ -1844,6 +1868,7 @@ def session_owner(session_id: str) -> str:
     return row["user_uuid"] if row else None
 
 
+@serialized_write
 def delete_session(session_id: str):
     c = _conn()
     c.execute("DELETE FROM chat_history WHERE session_id = ?", (session_id,))
@@ -1895,6 +1920,7 @@ def wechat_map_get(chat_hash: str):
     return dict(row) if row else None
 
 
+@serialized_write
 def wechat_map_upsert(chat_hash: str, vendor_company: str = None,
                      contact_uuid: str = None, notes: str = None) -> dict:
     c = _conn()
@@ -1918,6 +1944,7 @@ def wechat_map_upsert(chat_hash: str, vendor_company: str = None,
     return dict(row) if row else {}
 
 
+@serialized_write
 def wechat_map_delete(chat_hash: str) -> int:
     c = _conn()
     n = c.execute("DELETE FROM wechat_chat_map WHERE chat_hash = ?", (chat_hash,)).rowcount
@@ -1947,6 +1974,7 @@ def wechat_map_list() -> list:
     return results
 
 
+@serialized_write
 def update_contact(uuid: str, fields: dict) -> int:
     allowed = {"company", "person", "phone", "email", "website", "address",
                "wechat_id", "wechat_qr_url", "whatsapp", "viber", "telegram",
@@ -1967,6 +1995,7 @@ def update_contact(uuid: str, fields: dict) -> int:
     return n
 
 
+@serialized_write
 def update_product(uuid: str, fields: dict) -> int:
     allowed = {"company", "name", "model", "specs", "category", "price", "image_desc"}
     sets = {k: v for k, v in fields.items() if k in allowed}
@@ -1999,6 +2028,7 @@ def get_all_contact_records() -> list:
     return [dict(r) for r in rows]
 
 
+@serialized_write
 def merge_contacts(keep_uuid: str, merge_uuid: str) -> dict:
     c = _conn()
     keep = c.execute("SELECT * FROM contacts WHERE uuid = ?", (keep_uuid,)).fetchone()
@@ -2032,6 +2062,7 @@ def get_document(doc_id: int):
     return dict(row) if row else None
 
 
+@serialized_write
 def update_document_qr(doc_id: int, qr_payloads: list) -> int:
     c = _conn()
     n = c.execute(
@@ -2085,6 +2116,7 @@ def queue_errors(batch_id: str = None) -> list:
     return [dict(r) for r in rows]
 
 
+@serialized_write
 def queue_retry(queue_id: int):
     c = _conn()
     c.execute("UPDATE queue SET status = 'pending', error = NULL, processed_at = NULL WHERE id = ? AND status = 'error'",
@@ -2301,6 +2333,7 @@ def export_all() -> list:
     return results
 
 
+@serialized_write
 def populate_normalized_tables() -> dict:
     """Migrate existing documents into the normalized products and contacts tables."""
     c = _conn()
@@ -2421,6 +2454,7 @@ def get_documents_with_metadata(limit: int = 500) -> list:
     return results
 
 
+@serialized_write
 def backfill_metadata_columns():
     """Read the metadata JSON column for all documents and populate the flat metadata columns."""
     c = _conn()
@@ -2634,6 +2668,7 @@ def wechat_map_get(chat_hash: str):
     return dict(row) if row else None
 
 
+@serialized_write
 def wechat_map_set(chat_hash: str, vendor_company: str, contact_uuid: str = None, notes: str = None):
     c = _conn()
     c.execute(
@@ -2658,6 +2693,7 @@ def wechat_map_list() -> list:
     return [dict(r) for r in rows]
 
 
+@serialized_write
 def wechat_map_delete(chat_hash: str):
     c = _conn()
     c.execute("DELETE FROM wechat_chat_map WHERE chat_hash = ?", (chat_hash,))
@@ -2668,6 +2704,7 @@ def wechat_map_delete(chat_hash: str):
 # ---------------------------------------------------------------------------
 # Phone normalization migration
 # ---------------------------------------------------------------------------
+@serialized_write
 def migrate_phone_e164(default_region: str = "CN") -> dict:
     """Iterate existing contacts and populate phone_e164 from `phone` via phonenumbers."""
     try:
@@ -2894,6 +2931,7 @@ def get_all_contact_records_visible(user: dict) -> list:
 
 # ── Share toggle helpers ────────────────────────────────────────
 
+@serialized_write
 def set_document_shared(doc_id: int, is_shared: bool) -> int:
     c = _conn()
     n = c.execute("UPDATE documents SET is_shared = ? WHERE id = ?",
@@ -2903,6 +2941,7 @@ def set_document_shared(doc_id: int, is_shared: bool) -> int:
     return n
 
 
+@serialized_write
 def set_contact_shared(uuid: str, is_shared: bool) -> int:
     c = _conn()
     n = c.execute("UPDATE contacts SET is_shared = ? WHERE uuid = ?",
@@ -2912,6 +2951,7 @@ def set_contact_shared(uuid: str, is_shared: bool) -> int:
     return n
 
 
+@serialized_write
 def set_product_shared(uuid: str, is_shared: bool) -> int:
     c = _conn()
     n = c.execute("UPDATE products SET is_shared = ? WHERE uuid = ?",
@@ -2921,6 +2961,7 @@ def set_product_shared(uuid: str, is_shared: bool) -> int:
     return n
 
 
+@serialized_write
 def delete_contact(uuid: str) -> int:
     c = _conn()
     n = c.execute("DELETE FROM contacts WHERE uuid = ?", (uuid,)).rowcount
@@ -2929,6 +2970,7 @@ def delete_contact(uuid: str) -> int:
     return n
 
 
+@serialized_write
 def delete_product(uuid: str) -> int:
     c = _conn()
     n = c.execute("DELETE FROM products WHERE uuid = ?", (uuid,)).rowcount
