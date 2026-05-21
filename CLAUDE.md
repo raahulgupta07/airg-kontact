@@ -152,9 +152,14 @@ tags, document_tags, notes, meetings, events    workspace CRUD
 
 | Role | Sees |
 |------|------|
-| `super_admin` | everything across all users |
-| `admin` | everything (equivalent to super_admin) |
+| `super_admin` | everything across all users **+ Settings** (Users management, Admin Insights, on-demand jobs, cron) |
+| `admin` | all data across users, BUT **no Settings/Users/Admin Insights** (locked to super_admin as of 2026-05-21) |
 | `user` | only rows where `owner_uuid == user.uuid` |
+
+**Settings = super_admin ONLY** (commit `301e988`). Enforced both layers:
+- Frontend nav/tabs: `+layout.svelte` Settings tab `superOnly: true` (gated on `auth.isSuperAdmin`); `more/+page.svelte` Users/Admin tabs gated on `auth.isSuperAdmin`.
+- Backend: `/api/users*` → `require_role("super_admin")`; `_require_admin` (all `/api/admin/*`) → `role != "super_admin"` raises 403.
+- ⚠️ Frontend RBAC is compiled at build time — after changing role gates you MUST `docker compose up -d --build kontact` AND have the user hard-refresh (sw.js caches the shell). Old bundle = admin still sees stale Settings nav (backend still 403s, no data leak).
 
 Enforced by:
 - `database.visibility_clause(table_alias, user)` — appended to every query
@@ -281,7 +286,7 @@ POST   /api/auth/login              email + password, 10/min/IP
 POST   /api/auth/logout
 GET    /api/auth/me
 
-# Users (admin-only)
+# Users (super_admin only — was admin, locked 2026-05-21)
 GET POST PATCH DELETE /api/users{/uuid}
 
 # Upload + queue
