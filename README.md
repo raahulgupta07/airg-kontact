@@ -8,7 +8,8 @@ Multi-tenant. Hardened. Production-shape. One-tap mobile. Installable PWA (Andro
 
 ## What's new
 
-- **Multi-user stability** — global write-lock serializes SQLite writes; no more "database is locked" under concurrent uploads/logins. Single worker + threadpool (ChromaDB is single-process; see Dockerfile note to scale)
+- **Multi-user stability** — ALL SQLite writers (42 functions) now serialized via global write-lock; fixes "database is locked" that hit chat/upload under concurrent use (previously only ~7 hot writers were locked, the rest collided). No more crashes on single worker. Heavy work offloaded off the event loop so logins never freeze during photo batches. (Single worker only — multi-worker needs Postgres; see Scaling.)
+- **Role lockdown** — Settings (Users + Admin Insights) is now **super_admin only**, enforced in UI *and* backend. `admin` keeps full data access + Sync but cannot manage users or run maintenance jobs. See Auth → Roles.
 - **Delete** — per-card delete with double-confirm (type DELETE), owner-or-admin only; cascades products/contacts/vector/file
 - **Camera fix** — generic filenames (`image.jpg`) no longer silently rejected
 - **Chat guardrails** — answers only catalog data; blocks prompt-injection
@@ -95,13 +96,23 @@ Password:  KontactAdmin2026!
 - Per-user rate limits: 10/min login, 60/min upload, 120/min chat (slowapi)
 - Multi-tenant: `visibility_clause()` enforces `owner_uuid` filter on every visible query; `super_admin` sees all
 
+### Roles
+
+| Role | Can access |
+|------|------------|
+| `super_admin` | Everything — all data + **Settings** (Users management, Admin Insights, maintenance jobs, live cron edit) |
+| `admin` | All data (sees every user's rows) + Upload / Queue / Agent / Data / **Sync**. **No** Settings, user management, or admin jobs |
+| `user` | Own rows only — Upload / Queue / Agent / Data |
+
+Enforced both client-side (nav/tabs hidden) and server-side (`/api/users*` + `/api/admin/*` require `super_admin`; UI hiding alone is not security).
+
 Super admin bootstraps from `.env`:
 ```bash
 SUPER_ADMIN_EMAIL=admin@yourdomain.com
 SUPER_ADMIN_PASSWORD=<strong>
 SUPER_ADMIN_NAME=Your Name
 ```
-Additional users created via `/users` admin UI.
+Additional users created via Settings → Users (super_admin only).
 
 ---
 
@@ -429,6 +440,14 @@ proxy_read_timeout 300s;
 ```
 
 **Uploads slow / app stalls during a big batch** — already mitigated (heavy work runs off the event loop). For large teams see Scaling.
+
+**`sqlite3.OperationalError: database is locked`** — all writers are now serialized in-process, so this should not occur on a single worker. If it comes back, the cause is one of:
+- `UVICORN_WORKERS > 1` on SQLite — each worker is a separate process with its own lock → they collide. **Don't run multi-worker without Postgres** (see Scaling).
+- DB file on a network filesystem (NFS / EFS) — SQLite locking is unreliable there. Use local disk or EBS only.
+- A second process writing the same `kontact.db` (a stray `docker compose exec` script, sidecar, mis-set Litestream).
+- A new write function added without the `@serialized_write` decorator (or `with db.write_lock():`). Every writer must hold the lock.
+
+For a permanent fix at scale, migrate to Postgres — it removes the single-writer limit entirely.
 
 ---
 

@@ -225,7 +225,7 @@ async def change_password(payload: dict, request: Request, user=Depends(current_
 
 
 @app.get("/api/users")
-async def users_list(user=Depends(require_role("admin", "super_admin"))):
+async def users_list(user=Depends(require_role("super_admin"))):
     with db.db() as c:
         rows = db.list_users(c)
     return [
@@ -235,7 +235,7 @@ async def users_list(user=Depends(require_role("admin", "super_admin"))):
 
 
 @app.post("/api/users")
-async def users_create(payload: dict, user=Depends(require_role("admin", "super_admin"))):
+async def users_create(payload: dict, user=Depends(require_role("super_admin"))):
     name = (payload.get("name") or "").strip()
     if not name:
         raise HTTPException(400, "name required")
@@ -270,7 +270,7 @@ async def users_create(payload: dict, user=Depends(require_role("admin", "super_
 
 @app.patch("/api/users/{target_uuid}")
 async def users_update(target_uuid: str, payload: dict, user=Depends(current_user)):
-    is_admin = user["role"] in ("admin", "super_admin")
+    is_admin = user["role"] == "super_admin"   # user management = super_admin only
     is_self = user["uuid"] == target_uuid
     if not (is_admin or is_self):
         raise HTTPException(403, "forbidden")
@@ -316,7 +316,7 @@ async def users_update(target_uuid: str, payload: dict, user=Depends(current_use
 
 
 @app.delete("/api/users/{target_uuid}")
-async def users_delete(target_uuid: str, user=Depends(require_role("admin", "super_admin"))):
+async def users_delete(target_uuid: str, user=Depends(require_role("super_admin"))):
     with db.db() as c:
         row = db.get_user_by_uuid(c, target_uuid)
         if not row:
@@ -3243,9 +3243,10 @@ def my_stats(user=Depends(current_user)):
 # ─── BACKFILL + DEDUP + MERGE APPROVAL ENDPOINTS ───
 
 def _require_admin(user):
+    # Admin Insights / maintenance jobs = super_admin only (matches Settings UI).
     role = (user or {}).get("role")
-    if role not in ("super_admin", "admin"):
-        raise HTTPException(403, "admin required")
+    if role != "super_admin":
+        raise HTTPException(403, "super_admin required")
 
 
 @app.post("/api/admin/backfill/company")

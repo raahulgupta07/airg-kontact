@@ -24,7 +24,7 @@
   let tabs = $derived([
     { id: 'tools', label: 'Tools' },
     { id: 'stats', label: 'Stats' },
-    ...(auth.isAdmin ? [
+    ...(auth.isSuperAdmin ? [
       { id: 'users', label: '👥 Users' },
       { id: 'admin', label: '⚙ Admin Insights' },
     ] : []),
@@ -230,12 +230,12 @@
   {/if}
 
   <!-- USERS (admin only) -->
-  {#if activeTab === 'users' && auth.isAdmin}
+  {#if activeTab === 'users' && auth.isSuperAdmin}
     <UsersManager />
   {/if}
 
   <!-- ADMIN INSIGHTS (admin/super-admin only) -->
-  {#if activeTab === 'admin' && auth.isAdmin}
+  {#if activeTab === 'admin' && auth.isSuperAdmin}
     <AdminInsights />
   {/if}
 </div>

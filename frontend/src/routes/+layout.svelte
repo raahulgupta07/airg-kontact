@@ -27,16 +27,18 @@
   const isLoginRoute = $derived(currentPath === '/login');
 
   const ALL_TABS = [
-    { path: '/upload', label: 'Upload', key: 'upload', adminOnly: false },
-    { path: '/queue',  label: 'Queue',  key: 'queue',  adminOnly: false },
-    { path: '/chat',   label: 'Agent',  key: 'chat',   adminOnly: false },
-    { path: '/data',   label: 'Data',   key: 'data',   adminOnly: false },
-    { path: '/sync',   label: 'Sync',     key: 'sync',     adminOnly: true },
-    { path: '/more',   label: 'Settings', key: 'more',     adminOnly: true }
+    { path: '/upload', label: 'Upload', key: 'upload', adminOnly: false, superOnly: false },
+    { path: '/queue',  label: 'Queue',  key: 'queue',  adminOnly: false, superOnly: false },
+    { path: '/chat',   label: 'Agent',  key: 'chat',   adminOnly: false, superOnly: false },
+    { path: '/data',   label: 'Data',   key: 'data',   adminOnly: false, superOnly: false },
+    { path: '/sync',   label: 'Sync',     key: 'sync',  adminOnly: true,  superOnly: false },
+    { path: '/more',   label: 'Settings', key: 'more',  adminOnly: true,  superOnly: true }
   ] as const;
 
-  // Hide admin-only nav items from regular users
-  let tabs = $derived(ALL_TABS.filter(t => !t.adminOnly || auth.isAdmin));
+  // Hide admin-only nav from regular users; Settings is super_admin only.
+  let tabs = $derived(ALL_TABS.filter(t =>
+    (t.superOnly ? auth.isSuperAdmin : (!t.adminOnly || auth.isAdmin))
+  ));
 
   function isActive(tabPath: string): boolean {
     if (tabPath === '/upload') return currentPath === '/' || currentPath.startsWith('/upload');
