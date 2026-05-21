@@ -441,6 +441,13 @@ proxy_read_timeout 300s;
 
 **Uploads slow / app stalls during a big batch** — already mitigated (heavy work runs off the event loop). For large teams see Scaling.
 
+**An `admin` still sees the Settings / Sync tabs** — the RBAC fix is in the source, but the **frontend is compiled at build time**. The live site keeps serving the old bundle until you rebuild and the browser drops its cached one. Fix:
+```bash
+git pull                              # ensure the RBAC commit is present
+docker compose up -d --build kontact  # --build recompiles the SvelteKit bundle
+```
+Then have the affected user hard-refresh (Cmd/Ctrl+Shift+R) — the PWA service worker (`sw.js`) caches the shell. Backend already returns 403 on `/api/users*` for non-super-admins, so this is a stale-UI issue only — no data was exposed.
+
 **`sqlite3.OperationalError: database is locked`** — all writers are now serialized in-process, so this should not occur on a single worker. If it comes back, the cause is one of:
 - `UVICORN_WORKERS > 1` on SQLite — each worker is a separate process with its own lock → they collide. **Don't run multi-worker without Postgres** (see Scaling).
 - DB file on a network filesystem (NFS / EFS) — SQLite locking is unreliable there. Use local disk or EBS only.
