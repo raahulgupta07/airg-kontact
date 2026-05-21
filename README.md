@@ -339,45 +339,142 @@ Tested with AWS S3, Cloudflare R2, Backblaze B2, MinIO, Wasabi.
 
 ---
 
-## Backup + restore
+## Upgrade (pull new code → redeploy)
+
+All data lives in the **`kontact-data` Docker volume** — rebuilding the image **never touches it**. Safe to upgrade anytime.
 
 ```bash
-./backup.sh                          # → backups/kontact-backup-YYYYMMDD-HHMMSS.tar.gz
-./restore.sh <archive>               # idempotent restore on any server
+cd /path/to/airg-kontact
+
+# 1. backup first (see below) — recommended
+# 2. pull new code
+git pull origin main
+
+# 3. rebuild image + recreate container (this enables the new code;
+#    a plain restart keeps the OLD code — you MUST --build)
+docker compose up -d --build kontact
+
+# 4. verify
+docker compose ps
+docker compose logs --tail=40 kontact
+curl -f http://localhost:8090/health
 ```
 
-Captures: SQLite DB (WAL-checkpointed) + ChromaDB + uploads + extractions + `.env`. Single archive, ~2MB on a fresh install.
+Default upgrade = embedded ChromaDB + single worker. **No vector rebuild, no data change.** (Scaling is opt-in, see below.)
 
-Migrate to new server:
+---
+
+## Backup + restore (Docker-only — no shell scripts)
+
+Everything lives in the `kontact-data` volume (SQLite DB, ChromaDB, uploads, extractions). Back it up with plain `docker compose`:
+
+**Backup** (app can stay running — checkpoints SQLite first for a consistent copy):
 ```bash
-# OLD machine
-./backup.sh
-scp backups/kontact-backup-*.tar.gz user@new-server:/tmp/
+docker compose exec -T kontact sh -c \
+  "python3 -c \"import sqlite3;sqlite3.connect('/app/data/kontact.db').execute('PRAGMA wal_checkpoint(TRUNCATE)')\"; tar czf - -C /app/data ." \
+  > kontact-backup-$(date +%Y%m%d-%H%M%S).tar.gz
+```
+→ single `.tar.gz` in the current dir.
+
+**Restore** (stops app, restores into the volume, restarts):
+```bash
+docker compose stop kontact
+docker compose run --rm -T -v "$PWD:/host" kontact \
+  sh -c "rm -rf /app/data/* && tar xzf /host/kontact-backup-YYYYMMDD-HHMMSS.tar.gz -C /app/data"
+docker compose up -d kontact
+```
+
+**Migrate to a new server:**
+```bash
+# OLD machine — make backup (command above), then copy it:
+scp kontact-backup-*.tar.gz user@new-server:/tmp/
 
 # NEW machine
 git clone https://github.com/raahulgupta07/airg-kontact.git
 cd airg-kontact
-./restore.sh /tmp/kontact-backup-*.tar.gz
-docker compose up -d --build kontact
+cp .env.example .env        # then fill in secrets (see Configuration)
+docker compose up -d --build kontact       # creates the volume
+docker compose stop kontact
+docker compose run --rm -T -v "/tmp:/host" kontact \
+  sh -c "rm -rf /app/data/* && tar xzf /host/kontact-backup-*.tar.gz -C /app/data"
+docker compose up -d kontact
 ```
+
+> Tip: keep a `.env` backup separately — it is NOT inside the data volume.
 
 ---
 
-## Production deploy (HTTPS via Caddy)
+## Troubleshooting
+
+**"Login failed" / locked out** — 5 wrong passwords in 15 min locks an account ~30 min. Clear all login locks:
+```bash
+docker compose exec kontact python3 -c \
+  "import sqlite3;c=sqlite3.connect('/app/data/kontact.db');c.execute('DELETE FROM login_attempts');c.commit();print('cleared')"
+```
+
+**Reset a user's password:**
+```bash
+docker compose exec kontact python3 -c \
+  "import sqlite3,auth;c=sqlite3.connect('/app/data/kontact.db');c.execute('UPDATE users SET password_hash=? WHERE email=?',(auth.hash_secret('NewPass@123'),'user@example.com'));c.commit();print('reset')"
+```
+
+**Login fails for everyone behind a reverse proxy** — the proxy must forward the real client IP, and the app must trust it. The app already runs uvicorn with `--proxy-headers --forwarded-allow-ips="*"`; ensure your proxy sends `X-Forwarded-For` (Nginx Proxy Manager does by default).
+
+**Reverse proxy (Nginx Proxy Manager) required settings** — in the Proxy Host → **Advanced** tab:
+```nginx
+client_max_body_size 250M;   # else photo uploads fail with 413
+proxy_buffering off;         # else chat (SSE) stalls
+proxy_cache off;
+proxy_read_timeout 300s;
+```
+
+**Uploads slow / app stalls during a big batch** — already mitigated (heavy work runs off the event loop). For large teams see Scaling.
+
+---
+
+## Production deploy
 
 ```bash
 # In .env
 COOKIE_SECURE=true
 CORS_ORIGINS=https://kontact.yourdomain.com
-DOMAIN=kontact.yourdomain.com
 SUPER_ADMIN_PASSWORD=<rotate>
 SESSION_SECRET=<rotate>
+PORT=8090
 
-# DNS: A/AAAA record → server IP, port 80+443 open
-docker compose --profile https up -d
+docker compose up -d --build kontact
 ```
 
-Caddy auto-issues Let's Encrypt cert.
+Put a reverse proxy (TLS) in front. Two options:
+
+- **Your own proxy** (Nginx / Nginx Proxy Manager / Traefik) — point it at the host's `PORT`, scheme `http`. Set `client_max_body_size 250M;` + `proxy_buffering off;` (see Troubleshooting). This is the common setup.
+- **Bundled Caddy** (auto Let's Encrypt) — set `DOMAIN=` in `.env` and run `docker compose --profile https up -d`. Skip if you already have a proxy.
+
+---
+
+## Scaling (opt-in — Chroma server + multiple workers)
+
+Default = embedded ChromaDB + 1 uvicorn worker (good for ~10 concurrent users). To go higher, switch the vector store to a shared Chroma **server** so multiple workers can run safely.
+
+```bash
+# In .env
+CHROMA_HOST=chroma
+CHROMA_PORT=8000
+UVICORN_WORKERS=4
+
+# starts the chroma service (profile "scale") + kontact with N workers
+docker compose --profile scale up -d --build
+```
+
+What happens on first scale-up: the embedded vectors aren't read by the server, so the app **auto-rebuilds the vector index from extractions JSON on startup** (one worker, background). Your catalog/images/contacts (SQLite) are untouched. To rebuild manually anytime: `POST /api/index`.
+
+| Team size | Setup |
+|-----------|-------|
+| 1–10 | default — embedded Chroma, 1 worker |
+| 10–30 | `--profile scale`, `UVICORN_WORKERS=4`, Chroma server |
+| 50+ | migrate SQLite → Postgres (SQLite write-lock is in-process; many workers need Postgres) |
+
+> Note: with multiple workers, SQLite relies on WAL + `busy_timeout` for cross-process writes — fine to ~30 users. Beyond that, Postgres is the next step.
 
 ---
 
@@ -434,24 +531,30 @@ Caddy auto-issues Let's Encrypt cert.
 
 ## Capacity
 
-| Team size | Action |
-|-----------|--------|
-| 1–10 | works as-is, single uvicorn worker |
-| 10–50 | bump Dockerfile: `--workers 4` |
-| 50–500 | migrate SQLite → Postgres |
-| 500+ | multi-container + Redis + Postgres + S3 + pgvector |
+See **Scaling** above. Quick guide: 1–10 users = default; 10–30 = `--profile scale` + `UVICORN_WORKERS=4`; 50+ = Postgres.
 
 ---
 
-## Commands
+## Commands (Docker)
 
 ```bash
-# Dev
-docker compose up -d --build kontact
-docker compose logs -f kontact
+# Deploy / upgrade
+docker compose up -d --build kontact          # build new code + (re)start
+docker compose logs -f kontact                # tail logs
+docker compose ps                             # status
+docker compose restart kontact                # restart only (keeps current image)
 
-# Backup
-./backup.sh
+# Scale (opt-in) — needs CHROMA_HOST + UVICORN_WORKERS in .env
+docker compose --profile scale up -d --build
+
+# Backup (writes kontact-backup-*.tar.gz to current dir)
+docker compose exec -T kontact sh -c \
+  "python3 -c \"import sqlite3;sqlite3.connect('/app/data/kontact.db').execute('PRAGMA wal_checkpoint(TRUNCATE)')\"; tar czf - -C /app/data ." \
+  > kontact-backup-$(date +%Y%m%d-%H%M%S).tar.gz
+
+# Clear login locks
+docker compose exec kontact python3 -c \
+  "import sqlite3;c=sqlite3.connect('/app/data/kontact.db');c.execute('DELETE FROM login_attempts');c.commit();print('cleared')"
 
 # Migrate uploads to S3 (after STORAGE_BACKEND=s3 + S3_* set)
 docker compose exec kontact python3 migrate_to_s3.py
