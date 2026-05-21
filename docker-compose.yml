@@ -7,14 +7,10 @@ services:
       - kontact-data:/app/data
     env_file:
       - .env
-    # CHROMA_HOST switches vectorstore to the shared Chroma server, which is
-    # what lets you run UVICORN_WORKERS > 1 (PersistentClient can't). Set
-    # UVICORN_WORKERS in .env (default 1). Override port via CHROMA_PORT.
-    environment:
-      - CHROMA_HOST=${CHROMA_HOST:-chroma}
-      - CHROMA_PORT=${CHROMA_PORT:-8000}
-    depends_on:
-      - chroma
+    # DEFAULT = embedded ChromaDB + single worker (no behavior/data change).
+    # To scale: set CHROMA_HOST=chroma + UVICORN_WORKERS=4 in .env, then run
+    #   docker compose --profile scale up -d --build
+    # (CHROMA_HOST is read from .env by vectorstore.py; empty/unset = embedded.)
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8000}/health"]
@@ -22,11 +18,12 @@ services:
       timeout: 5s
       retries: 3
 
-  # Shared vector DB. Single process, but ALL kontact workers talk to it over
-  # HTTP — so kontact can scale to multiple workers safely. Not published to
-  # the host; reachable only on the compose network as `chroma:8000`.
+  # Shared vector DB — OPT-IN. Only starts with `--profile scale`. ALL kontact
+  # workers talk to it over HTTP so kontact can run multiple workers safely.
+  # Not published to the host; reachable on the compose network as chroma:8000.
   chroma:
     image: chromadb/chroma:1.4.1
+    profiles: ["scale"]
     restart: unless-stopped
     volumes:
       - chroma-data:/data
